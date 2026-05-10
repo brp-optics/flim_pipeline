@@ -1,0 +1,26 @@
+[project]
+name = "flim-pipeline"
+version = "0.1.0"
+description = "Pipeline for Bjorn's FLIM analysis."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "matplotlib>=3.10.8",
+    "numpy>=2.4.3",
+    "pandas>=3.0.2",
+    "pyqt5>=5.15.11",
+    "scipy>=1.17.1",
+    "sdtfile>=2026.2.8",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.2.0",
+    "jupyterlab>=4.5.7",
+    "jupytext>=1.19.1",
+    "pytest",
+    "ruff",
+]
+
+[tool.jupytext]
+formats = "notebooks//py:percent,notebooks//ipynb"
