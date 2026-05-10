@@ -1,2 +1,3 @@
+.PHONY: notebooks
 notebooks:
-    uv run jupytext --sync notebooks/*.py
+	uv run jupytext --sync notebooks/*.py
