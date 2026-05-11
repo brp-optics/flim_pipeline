@@ -80,6 +80,12 @@ def irf_peak_fwhm(decay: np.ndarray, t_ns: np.ndarray) -> dict:
     }
 
 
+def _group_by_session(records: list) -> list:
+    from itertools import groupby
+    keyed = sorted(records, key=lambda r: r["session_root"])
+    return [(s, list(g)) for s, g in groupby(keyed, key=lambda r: r["session_root"])]
+
+
 def cluster_filter_irf(df: pd.DataFrame, window_min: float) -> pd.DataFrame:
     """Keep only the later of consecutive IRF pairs within window_min minutes."""
     df = df.sort_values("acquisition_time").reset_index(drop=True)
@@ -140,13 +146,6 @@ for ax, (session, sess_records) in zip(axes[0], _group_by_session(irf_records)):
 
 plt.tight_layout()
 plt.show()
-
-
-def _group_by_session(records: list) -> list:
-    from itertools import groupby
-    keyed = sorted(records, key=lambda r: r["session_root"])
-    return [(s, list(g)) for s, g in groupby(keyed, key=lambda r: r["session_root"])]
-
 
 # %%
 # Peak drift check: compare first vs last IRF per session
@@ -210,8 +209,12 @@ for irf_path in sorted(_irf_export_paths):
     export_decay = load_irf_export(irf_path)
     export_norm = normalize_decay(export_decay)
 
-    # Find matching urea SDT rows by sample_index
-    matching = irf_all[irf_all["sample_index"].isin(seqs)]
+    # Find matching urea SDT rows by date and sample_index
+    irf_date = irf_path.stem[:8]
+    matching = irf_all[
+        irf_all["session_root"].str.startswith(irf_date) &
+        irf_all["sample_index"].isin(seqs)
+    ]
     if matching.empty:
         print(f"  {irf_path.name}: sequences {seqs} -- no matching urea SDT found")
         continue
@@ -233,6 +236,7 @@ for irf_path in sorted(_irf_export_paths):
         t_ax = np.arange(256)
         ax.plot(t_ax, raw_norm, label="raw urea sum")
         ax.plot(t_ax, export_norm, label="SPCImage .irf", linestyle="--")
+        ax.set_yscale("log")
         ax.set_title(irf_path.name)
         ax.legend()
         plt.tight_layout()
@@ -371,21 +375,35 @@ for _, row in chroma_all.iterrows():
     t_s  = sdt.times[0]                 # seconds
 
     G, S = phasor_from_decay(data, t_s, OMEGA)
+    total = data.sum(axis=-1)           # per-pixel photon counts (nx, ny)
 
-    # Spatial uniformity
-    valid = np.isfinite(G) & np.isfinite(S)
-    G_mean, S_mean = float(np.nanmean(G)), float(np.nanmean(S))
-    G_std,  S_std  = float(np.nanstd(G)),  float(np.nanstd(S))
+    # Keep top 50% of valid pixels by photon count; discard background
+    valid = np.isfinite(G) & np.isfinite(S) & (total > 0)
+    thresh = float(np.percentile(total[valid], 50)) if valid.any() else 0.0
+    mask = valid & (total >= thresh)
+
+    G_filt = G[mask].ravel()
+    S_filt = S[mask].ravel()
+    w_filt = total[mask].ravel()
+
+    # Intensity-weighted mean for calibration factor
+    w_sum = w_filt.sum()
+    if w_sum > 0:
+        G_mean = float(np.average(G_filt, weights=w_filt))
+        S_mean = float(np.average(S_filt, weights=w_filt))
+        G_std  = float(np.sqrt(np.average((G_filt - G_mean)**2, weights=w_filt)))
+        S_std  = float(np.sqrt(np.average((S_filt - S_mean)**2, weights=w_filt)))
+    else:
+        G_mean = S_mean = G_std = S_std = float("nan")
 
     phase_corr, mod_corr = phasor_cal_factors(G_mean, S_mean, G_ref_theory, S_ref_theory)
 
     print(f"\n{row['filename']}")
     print(f"  G_meas={G_mean:.4f} +/- {G_std:.4f}   S_meas={S_mean:.4f} +/- {S_std:.4f}")
     print(f"  phase_corr={np.degrees(phase_corr):.3f} deg   mod_corr={mod_corr:.4f}")
-    print(f"  valid pixels: {valid.sum()} / {valid.size}")
+    print(f"  pixels used: {mask.sum()} / {valid.sum()} valid (top 50% by counts)")
 
-    uniformity_ok = G_std < 0.05 and S_std < 0.05
-    if not uniformity_ok:
+    if G_std > 0.05 or S_std > 0.05:
         print(f"  WARNING: high spatial variance -- chroma slide may be non-uniform")
 
     chroma_cal_records.append({
@@ -398,26 +416,56 @@ for _, row in chroma_all.iterrows():
         "S_std":            S_std,
         "phase_corr_rad":   phase_corr,
         "mod_corr":         mod_corr,
+        "_G_filt":          G_filt,
+        "_S_filt":          S_filt,
+        "_w_filt":          w_filt,
     })
 
-chroma_cal_df = pd.DataFrame(chroma_cal_records)
+chroma_cal_df = pd.DataFrame([
+    {k: v for k, v in r.items() if not k.startswith("_")}
+    for r in chroma_cal_records
+])
 
 # %%
-# Plot: measured chroma phasors vs theoretical on universal semicircle
+# Plot: per-pixel phasor before and after calibration (intensity-weighted hexbin)
+# Left column: raw G/S (rotated by time-axis offset).
+# Right column: calibrated G/S (should cluster at the theoretical reference point).
 theta = np.linspace(0, np.pi, 300)
-fig, ax = plt.subplots(figsize=(5, 3))
-ax.plot(0.5 + 0.5 * np.cos(theta), 0.5 * np.sin(theta), "k-", lw=0.8, label="semicircle")
-ax.scatter([G_ref_theory], [S_ref_theory], marker="*", s=120, color="black",
-           zorder=5, label=f"theory {CHROMA_TAU_REF_NS} ns")
-for _, rec in chroma_cal_df.iterrows():
-    ax.scatter(rec["G_meas"], rec["S_meas"], label=rec["filename"][:25])
-ax.set_xlabel("G")
-ax.set_ylabel("S")
-ax.set_xlim(-0.05, 1.05)
-ax.set_ylim(-0.02, 0.55)
-ax.set_aspect("equal")
-ax.legend(fontsize=7)
-ax.set_title("Chroma phasor: measured vs theoretical")
+n_ch  = len(chroma_cal_records)
+
+fig, axes = plt.subplots(n_ch, 2,
+                         figsize=(12, 5 * n_ch),
+                         squeeze=False)
+
+for row_i, rec in enumerate(chroma_cal_records):
+    G_filt     = rec["_G_filt"]
+    S_filt     = rec["_S_filt"]
+    w_filt     = rec["_w_filt"]
+    phase_corr = rec["phase_corr_rad"]
+    mod_corr   = rec["mod_corr"]
+
+    G_cal, S_cal = phasor_apply_cal(G_filt, S_filt, phase_corr, mod_corr)
+
+    panels = [
+        (axes[row_i, 0], G_filt, S_filt, rec["G_meas"], rec["S_meas"], "raw"),
+        (axes[row_i, 1], G_cal,  S_cal,  G_ref_theory,  S_ref_theory,  "calibrated"),
+    ]
+    for ax, G_p, S_p, G_mu, S_mu, suffix in panels:
+        hb = ax.hexbin(G_p, S_p, C=w_filt, reduce_C_function=np.sum,
+                       gridsize=60, cmap="viridis", mincnt=1)
+        plt.colorbar(hb, ax=ax, label="total counts")
+        ax.plot(0.5 + 0.5 * np.cos(theta), 0.5 * np.sin(theta),
+                "w-", lw=1.0, alpha=0.6)
+        ax.scatter([G_ref_theory], [S_ref_theory], marker="*", s=150,
+                   color="red", zorder=5, label=f"theory {CHROMA_TAU_REF_NS} ns")
+        ax.scatter([G_mu], [S_mu], marker="+", s=200, linewidths=2,
+                   color="white", zorder=5, label="weighted mean")
+        ax.set_xlabel("G")
+        ax.set_ylabel("S")
+        ax.set_aspect("equal", adjustable="datalim")
+        ax.set_title(f"{rec['filename'][:40]} -- {suffix}")
+        ax.legend(fontsize=7)
+
 plt.tight_layout()
 plt.show()
 

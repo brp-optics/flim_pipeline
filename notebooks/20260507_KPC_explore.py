@@ -942,3 +942,5 @@ try:
     print(f"Saved Excel export to {excel_path}")
 except ImportError:
     print("openpyxl not installed -- using CSV only (run: uv add --dev openpyxl)")
+
+# %%
