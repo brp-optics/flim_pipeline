@@ -547,6 +547,134 @@ print(sdt_df[sdt_df["file_type"] == "sample"][
     ["filename", "acquisition_time", "phasor_cal_phase_rad", "phasor_cal_mod", "phasor_cal_source"]
 ].head(10).to_string())
 
+# %% [markdown]
+# ## Step 6b: Urea-based fine-correction
+#
+# After chroma calibration, urea (tau ~ 0) should appear at (G=1, S=0).
+# Any residual is a per-session systematic error -- typically a small modulation
+# over/under-correction from the chromabead acquisition conditions varying between
+# sessions.
+#
+# For each session we:
+#   1. Apply the session's chroma calibration to all urea files
+#   2. Compute the intensity-weighted mean calibrated phasor (G_urea, S_urea)
+#   3. Derive a secondary correction:
+#        urea_phase_add  = -arctan2(S_urea, G_urea)   [small rotation to zero]
+#        urea_mod_scale  = 1 / |G_urea + i*S_urea|    [rescale to unit circle]
+#   4. Combine with the chroma correction (additions/multiplications in phasor space)
+#      and update phasor_cal_phase_rad / phasor_cal_mod for all sample files in
+#      that session.
+#
+# The saved values already include the combined correction -- Phase D consumes them
+# transparently.
+
+# %%
+urea_corr_records = []
+
+for session, urea_grp in irf_all.groupby("session_root", sort=True):
+    # Session's chroma cal timepoints
+    sess_cal = chroma_cal_df_filt[
+        chroma_cal_df_filt["session_root"] == session
+    ].sort_values("acquisition_time").reset_index(drop=True)
+    if sess_cal.empty:
+        print(f"  {session}: no chroma cal available -- skipping urea correction")
+        continue
+
+    G_list, S_list, w_list = [], [], []
+
+    for _, row in urea_grp.iterrows():
+        fp = row.get("filepath")
+        if pd.isna(fp) or not Path(str(fp)).exists():
+            continue
+
+        # Nearest-in-time chroma cal for this urea file (same logic as assign_phasor_cal)
+        t_s = pd.Timestamp(row["acquisition_time"]).to_numpy()
+        before = sess_cal[sess_cal["acquisition_time"] <= pd.Timestamp(t_s)]
+        after  = sess_cal[sess_cal["acquisition_time"] >  pd.Timestamp(t_s)]
+
+        if not before.empty and not after.empty:
+            b, a = before.iloc[-1], after.iloc[0]
+            t0 = pd.Timestamp(b["acquisition_time"]).timestamp()
+            t1 = pd.Timestamp(a["acquisition_time"]).timestamp()
+            ts = pd.Timestamp(t_s).timestamp()
+            wi = np.clip((ts - t0) / (t1 - t0), 0.0, 1.0) if t1 > t0 else 0.0
+            phase_c = (1 - wi) * b["phase_corr_rad"] + wi * a["phase_corr_rad"]
+            mod_c   = (1 - wi) * b["mod_corr"]       + wi * a["mod_corr"]
+        elif not before.empty:
+            phase_c = before.iloc[-1]["phase_corr_rad"]
+            mod_c   = before.iloc[-1]["mod_corr"]
+        else:
+            phase_c = after.iloc[0]["phase_corr_rad"]
+            mod_c   = after.iloc[0]["mod_corr"]
+
+        try:
+            sdt_obj = SdtFile(str(fp))
+            data    = sdt_obj.data[0].astype(float)
+            t_sec   = sdt_obj.times[0]
+        except Exception as exc:
+            print(f"  Load failed {row['filename']}: {exc}")
+            continue
+
+        G_raw, S_raw = phasor_from_decay(data, t_sec, OMEGA)
+        G_cal, S_cal = phasor_apply_cal(G_raw, S_raw, phase_c, mod_c)
+
+        ph = data.sum(axis=-1)
+        ok = np.isfinite(G_cal) & np.isfinite(S_cal) & (ph > 0)
+        if not ok.any():
+            continue
+        w = ph[ok]
+        G_list.append(float(np.average(G_cal[ok], weights=w)))
+        S_list.append(float(np.average(S_cal[ok], weights=w)))
+        w_list.append(float(w.sum()))
+
+    if not G_list:
+        print(f"  {session}: no usable urea files -- skipping")
+        continue
+
+    # Photon-count weighted mean over all urea files in session
+    w_tot  = sum(w_list)
+    G_urea = sum(g * w for g, w in zip(G_list, w_list)) / w_tot
+    S_urea = sum(s * w for s, w in zip(S_list, w_list)) / w_tot
+
+    urea_phase_add = -float(np.arctan2(S_urea, G_urea))
+    urea_mod_scale = 1.0 / float(np.hypot(G_urea, S_urea))
+    dist           = float(np.hypot(G_urea - 1.0, S_urea))
+
+    urea_corr_records.append({
+        "session":        session,
+        "G_urea_cal":     round(G_urea, 5),
+        "S_urea_cal":     round(S_urea, 5),
+        "dist_from_10":   round(dist, 5),
+        "urea_phase_add": round(urea_phase_add, 6),
+        "urea_mod_scale": round(urea_mod_scale, 6),
+        "n_urea_files":   len(G_list),
+    })
+
+    print(f"  {session}  G={G_urea:.4f}  S={S_urea:.4f}  dist={dist:.4f}")
+    print(f"    phase_add={np.degrees(urea_phase_add):.3f} deg  "
+          f"mod_scale={urea_mod_scale:.5f}")
+
+urea_corr_df = pd.DataFrame(urea_corr_records)
+print("\nUrea fine-correction per session:")
+print(urea_corr_df.to_string(index=False))
+
+# Apply combined correction: update sample cal values in sdt_df
+for _, corr in urea_corr_df.iterrows():
+    sel = (
+        (sdt_df["file_type"]   == "sample") &
+        (sdt_df["session_root"] == corr["session"]) &
+        sdt_df["phasor_cal_phase_rad"].notna()
+    )
+    sdt_df.loc[sel, "phasor_cal_phase_rad"] += corr["urea_phase_add"]
+    sdt_df.loc[sel, "phasor_cal_mod"]       *= corr["urea_mod_scale"]
+
+n_updated = int(sdt_df["phasor_cal_phase_rad"].notna().sum())
+print(f"\nUpdated phasor_cal_phase_rad / phasor_cal_mod for {n_updated} sample files.")
+print("Combined (chroma + urea) correction stored -- Phase D reads these directly.")
+
+# Save urea correction table for reference
+urea_corr_df.to_csv(results_dir / "urea_cal_correction.csv", index=False)
+
 # %%
 # Save updated metadata
 out_path = results_dir / "sdt_metadata_cal.csv"
