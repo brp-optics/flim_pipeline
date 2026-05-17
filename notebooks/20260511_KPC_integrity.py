@@ -34,7 +34,13 @@ CHI2_HI = 2.0    # flag pixels above this
 # Orientation of SPCImage .asc arrays relative to the SDT pixel array.
 # OpenScan flips vertically vs BH. Confirmed in Step 8; update if wrong.
 # Options: None | "flipud" | "fliplr" | "transpose" | "flipud+transpose"
-ORIENTATION_TRANSFORM = "flipud"
+ORIENTATION_TRANSFORM = None    # confirmed in Step 8: SDT and SPCImage raw are already aligned
+
+# Preferred number of fit components per fixation type (for selecting fit model
+# when multiple exports are present in fit_map.csv):
+#   glu:  3-component (ultra-short artifact a1 + two NADH components)
+#   form/live: 2-component (standard free/total NADH)
+PREFERRED_N_COMP = {"glu": 3, "form": 2, "live": 2}
 
 # Amplitude ratio definition per fixation type:
 #   glu:       a2/(a2+a3)  -- skip ultra-short artifact component a1 (~16 ps)
@@ -51,13 +57,26 @@ results_dir = Path("../results")
 
 sdt_df = pd.read_csv(results_dir / "sdt_metadata_cal.csv")
 fp_map = pd.read_csv(results_dir / "filepath_map.csv")
+# fp_map may have duplicate filename rows (multiple drives / data dirs scanned).
+# Keep first occurrence per filename to avoid fan-out in the merge.
+fp_map = fp_map.drop_duplicates(subset="filename", keep="first")
 sdt_df = sdt_df.merge(fp_map[["filename", "filepath"]], on="filename", how="left")
+# Drop any remaining full-row duplicates (e.g. from sdt_metadata_cal itself).
+n_before = len(sdt_df)
+sdt_df = sdt_df.drop_duplicates()
+if len(sdt_df) < n_before:
+    print(f"Dropped {n_before - len(sdt_df)} duplicate rows after merge.")
 sdt_df["filepath"]         = sdt_df["filepath"].map(Path)
 sdt_df["acquisition_time"] = pd.to_datetime(sdt_df["acquisition_time"])
 sdt_df["has_fit_export"]   = sdt_df["has_fit_export"].fillna(False).astype(bool)
 
+fit_map_df = pd.read_csv(results_dir / "fit_map.csv")
+
 print(f"Loaded {len(sdt_df)} SDT files")
 print(sdt_df["file_type"].value_counts().to_string())
+print(f"\nLoaded fit_map: {len(fit_map_df)} fit-set/SDT pairs")
+if "n_components" in fit_map_df.columns:
+    print(fit_map_df["n_components"].value_counts().sort_index().to_string())
 
 # %%
 # -- Rebuild fit_data from .asc files --------------------------------------
@@ -117,18 +136,62 @@ def _load_asc(filepath: Path) -> dict | None:
 asc_paths = [fp for d in data_dirs for fp in sorted(d.rglob("*.asc"))]
 print(f"\nFound {len(asc_paths)} .asc files -- loading...")
 
+# Key format matches Phase A: "{session_root}::{rel_dir}::{base_stem}"
 fit_data: dict[str, dict] = {}
-n_failures = 0
+n_failures = n_skipped = 0
 for fp in asc_paths:
+    if re.search(r"_statistic", fp.stem, re.IGNORECASE):
+        n_skipped += 1
+        continue
     result = _load_asc(fp)
     if result is None:
         n_failures += 1
         continue
-    base = _strip_param_suffix(fp.stem)
-    fit_data.setdefault(base, {})[result["param"]] = result["data"]
-    fit_data[base][f"_path_{result['param']}"] = fp
+    parent_dir   = next((d for d in data_dirs if str(fp).startswith(str(d))), None)
+    session_root = parent_dir.name if parent_dir else "unknown"
+    rel_dir      = str(fp.relative_to(parent_dir).parent) if parent_dir else str(fp.parent.name)
+    base         = _strip_param_suffix(fp.stem)
+    fit_set_key  = f"{session_root}::{rel_dir}::{base}"
+    fit_data.setdefault(fit_set_key, {
+        "_session_root": session_root,
+        "_folder":       rel_dir,
+        "_base_stem":    base,
+    })[result["param"]] = result["data"]
+    fit_data[fit_set_key][f"_path_{result['param']}"] = fp
 
-print(f"Grouped into {len(fit_data)} image sets  ({n_failures} parse failures)")
+print(f"Grouped into {len(fit_data)} fit sets  "
+      f"({n_skipped} statistics skipped, {n_failures} parse failures)")
+
+# %%
+# Diagnostic: what param names actually loaded?
+all_found = sorted(set(k for fd in fit_data.values() for k in fd if not k.startswith("_")))
+print("Param names found across all fit_data entries:", all_found)
+
+print("\nSample .asc filenames (first 30):")
+for p in asc_paths[:30]:
+    print(f"  {p.name}  ->  inferred param: {_infer_param_name(p.stem)!r}  "
+          f"base: {_strip_param_suffix(p.stem)!r}")
+
+# Helper: select best fit_set_key for a file using fit_map_df + PREFERRED_N_COMP
+def best_fit_key(filename: str, fixation_type: str = None) -> str | None:
+    """Return the preferred fit_set_key for a file.
+
+    Selects by PREFERRED_N_COMP[fixation_type] when available.
+    Falls back to the key with the highest n_components.
+    """
+    rows = fit_map_df[fit_map_df["sdt_filename"] == filename]
+    if rows.empty:
+        return None
+    preferred = PREFERRED_N_COMP.get(str(fixation_type)) if fixation_type else None
+    if preferred is not None and "n_components" in rows.columns:
+        exact = rows[rows["n_components"] == preferred]
+        if not exact.empty:
+            return str(exact.iloc[0]["fit_set_key"])
+    col = "n_components" if "n_components" in rows.columns else None
+    if col:
+        return str(rows.sort_values(col, ascending=False).iloc[0]["fit_set_key"])
+    return str(rows.iloc[0]["fit_set_key"])
+
 
 # Convenience: apply orientation correction to a fit array
 def apply_orientation(arr: np.ndarray, transform) -> np.ndarray:
@@ -163,13 +226,19 @@ print(f"Sample files with fit exports: {len(sample_fits)}\n")
 
 inv_rows = []
 for _, row in sample_fits.iterrows():
-    base = row.get("fit_base_stem")
-    if not isinstance(base, str) or base not in fit_data:
+    key = best_fit_key(row["filename"], row.get("fixation_type"))
+    if key is None or key not in fit_data:
         continue
-    fd = fit_data[base]
+    fd = fit_data[key]
+    fm_match = fit_map_df[
+        (fit_map_df["sdt_filename"] == row["filename"]) &
+        (fit_map_df["fit_set_key"]  == key)
+    ]
+    n_comp = int(fm_match.iloc[0]["n_components"]) if not fm_match.empty else None
     inv_rows.append({
         "filename":      row["filename"],
         "fixation_type": row.get("fixation_type"),
+        "n_components":  n_comp,
         **{p: (p in fd) for p in ALL_PARAMS},
     })
 
@@ -179,6 +248,9 @@ print("Parameter availability by fixation type:")
 for fix, grp in inv_df.groupby("fixation_type", dropna=False):
     n = len(grp)
     print(f"\n  {fix} ({n} files):")
+    if "n_components" in grp.columns:
+        nc = grp["n_components"].value_counts().sort_index()
+        print(f"    fit models (n_comp): {dict(nc)}")
     for p in ALL_PARAMS:
         if p in grp.columns and grp[p].any():
             print(f"    {p:12s}: {int(grp[p].sum())}/{n}")
@@ -187,10 +259,10 @@ for fix, grp in inv_df.groupby("fixation_type", dropna=False):
 # Shift check: shift was fixed to 0 in SPCImage -- verify
 shift_issues = []
 for _, row in sample_fits.iterrows():
-    base = row.get("fit_base_stem")
-    if not isinstance(base, str) or base not in fit_data:
+    key = best_fit_key(row["filename"], row.get("fixation_type"))
+    if key is None or key not in fit_data:
         continue
-    fd = fit_data[base]
+    fd = fit_data[key]
     if "shift" not in fd:
         continue
     arr = fd["shift"]
@@ -229,9 +301,9 @@ print(f"Orientation check: {orient_row['filename']}")
 sdt_obj       = SdtFile(str(orient_row["filepath"]))
 sdt_intensity = sdt_obj.data[0].astype(float).sum(axis=2)
 
-base = orient_row.get("fit_base_stem", "")
-fd   = fit_data.get(base, {})
-ref_map = fd.get("photons") or fd.get("a1") or fd.get("a2")
+key = best_fit_key(orient_row["filename"], orient_row.get("fixation_type"))
+fd  = fit_data.get(key, {}) if key else {}
+ref_map = next((fd[p] for p in ("photons", "a1", "a2", "a3") if p in fd), None)
 
 if ref_map is None:
     print("No usable fit export found for orientation check.")
@@ -281,10 +353,10 @@ else:
 # %%
 chi2_records = []
 for _, row in sample_fits.iterrows():
-    base = row.get("fit_base_stem")
-    if not isinstance(base, str) or base not in fit_data:
+    key = best_fit_key(row["filename"], row.get("fixation_type"))
+    if key is None or key not in fit_data:
         continue
-    fd = fit_data[base]
+    fd = fit_data[key]
     if "chi2" not in fd:
         continue
     arr  = apply_orientation(fd["chi2"], ORIENTATION_TRANSFORM)
@@ -328,18 +400,46 @@ if fix_types:
     plt.show()
 
 # %%
-# Spatial chi^2 map -- one representative file per fixation type
-if fix_types:
-    fig, axes = plt.subplots(1, len(fix_types),
-                             figsize=(5 * len(fix_types), 4), squeeze=False)
-    for ax, ft in zip(axes[0], fix_types):
-        recs = [r for r in chi2_records if r["fixation_type"] == ft]
-        if not recs:
-            continue
-        im = ax.imshow(recs[0]["_arr"], cmap="RdYlGn_r", vmin=0.5, vmax=3.0)
-        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="chi^2")
-        ax.set_title(f"{ft}: {recs[0]['filename'][:30]}")
-        ax.axis("off")
+# Spatial chi^2 map paired with photon intensity -- one file per fixation type
+for ft in fix_types:
+    recs = [r for r in chi2_records if r["fixation_type"] == ft]
+    if not recs:
+        continue
+    rec = recs[0]
+
+    # Load matching intensity (SDT sum or photons export)
+    row_match = sample_fits[sample_fits["filename"] == rec["filename"]]
+    intensity = None
+    if not row_match.empty:
+        _key = best_fit_key(row_match.iloc[0]["filename"],
+                            row_match.iloc[0].get("fixation_type"))
+        _fd  = fit_data.get(_key, {}) if _key else {}
+        intensity = next((apply_orientation(_fd[p], ORIENTATION_TRANSFORM)
+                          for p in ("photons", "a1", "a2", "a3") if p in _fd), None)
+        if intensity is None:
+            try:
+                sdt_obj = SdtFile(str(row_match.iloc[0]["filepath"]))
+                intensity = sdt_obj.data[0].astype(float).sum(axis=2)
+            except Exception:
+                pass
+
+    n_cols = 2 if intensity is not None else 1
+    fig, axes = plt.subplots(1, n_cols, figsize=(5 * n_cols, 4))
+    if n_cols == 1:
+        axes = [axes]
+
+    if intensity is not None:
+        vmax_i = float(np.percentile(intensity[intensity > 0], 99)) if (intensity > 0).any() else 1
+        axes[0].imshow(intensity, cmap="inferno", vmin=0, vmax=vmax_i)
+        axes[0].set_title("intensity (photons)")
+        axes[0].axis("off")
+
+    im = axes[-1].imshow(rec["_arr"], cmap="RdYlGn_r", vmin=0.5, vmax=3.0)
+    plt.colorbar(im, ax=axes[-1], fraction=0.046, pad=0.04, label="chi^2")
+    axes[-1].set_title("chi^2")
+    axes[-1].axis("off")
+
+    plt.suptitle(f"{ft}: {rec['filename'][:60]}", fontsize=8)
     plt.tight_layout()
     plt.show()
 
@@ -369,10 +469,10 @@ for fix_type in ["glu", "form", "live"]:
     for ax, param in zip(axes[0], params_show):
         arrays = []
         for _, row in rows.iterrows():
-            base = row.get("fit_base_stem")
-            if not isinstance(base, str) or base not in fit_data:
+            key = best_fit_key(row["filename"], row.get("fixation_type"))
+            if key is None or key not in fit_data:
                 continue
-            fd = fit_data[base]
+            fd = fit_data[key]
             if param not in fd:
                 continue
             arr = apply_orientation(fd[param], ORIENTATION_TRANSFORM).ravel()
@@ -416,10 +516,10 @@ for fix_type, (num_p, den_p) in RATIO_CFG.items():
 
     ratio_maps = []
     for _, row in rows.iterrows():
-        base = row.get("fit_base_stem")
-        if not isinstance(base, str) or base not in fit_data:
+        key = best_fit_key(row["filename"], row.get("fixation_type"))
+        if key is None or key not in fit_data:
             continue
-        fd = fit_data[base]
+        fd = fit_data[key]
         if num_p not in fd or den_p not in fd:
             continue
         a_n = apply_orientation(fd[num_p], ORIENTATION_TRANSFORM)
@@ -456,21 +556,176 @@ for fix_type, (num_p, den_p) in RATIO_CFG.items():
 
 # %%
 # Save chi^2 summary to results
-chi2_save = chi2_df.copy()
-chi2_save.to_csv(results_dir / "chi2_summary.csv", index=False)
+chi2_df.to_csv(results_dir / "chi2_summary.csv", index=False)
 print(f"Saved chi^2 summary to {results_dir / 'chi2_summary.csv'}")
+
+# %% [markdown]
+# ## Step 12: Position annotation template
+#
+# Each field of view needs a morphology label before group analysis.
+# Labels: single_cell | colony_deep | colony_edge | colony_island | no_cells | other
+#
+# Matching sets (same session + frame_index): transmitted, FLIM 457s50, FLIM 535s50.
+# The annotation is at the field-of-view level (one label per position),
+# so matching files share the same frame_index within a session+sample.
+#
+# Workflow:
+#   1. Run this cell -> writes results/position_annotation.csv (blank annotations)
+#   2. Open in Excel / LibreOffice, fill in the "annotation" column
+#   3. Downstream notebooks read and merge by filename
+
+# %%
+ANNOTATION_OPTIONS = ["single_cell", "colony_deep", "colony_edge",
+                      "colony_island", "no_cells", "other"]
+
+annot_cols = ["filename", "session_root", "session_date", "fixation_type",
+              "cell_type", "sample_index", "frame_index", "em_filter_nm",
+              "acquisition_time"]
+annot_cols_present = [c for c in annot_cols if c in sdt_df.columns]
+
+annot_df = (
+    sdt_df[sdt_df["file_type"] == "sample"][annot_cols_present]
+    .sort_values(["session_root", "sample_index", "frame_index", "em_filter_nm"],
+                 na_position="last")
+    .copy()
+    .reset_index(drop=True)
+)
+annot_df["annotation"] = ""    # user fills: one of ANNOTATION_OPTIONS
+annot_df["notes"]      = ""    # free text
+
+annot_path = results_dir / "position_annotation.csv"
+
+if annot_path.exists():
+    # Merge with existing file: preserve filled annotations, rebuild metadata columns.
+    # Uses filename as the join key -- safe because sdt_df is already deduplicated above.
+    existing = pd.read_csv(annot_path).drop_duplicates(subset="filename", keep="first")
+    saved_cols = ["filename", "annotation", "notes"]
+    saved = existing[[c for c in saved_cols if c in existing.columns]]
+    merged = annot_df.merge(saved, on="filename", how="left", suffixes=("", "_saved"))
+    # Prefer saved values over blanks
+    for col in ("annotation", "notes"):
+        saved_col = col + "_saved"
+        if saved_col in merged.columns:
+            merged[col] = merged[saved_col].where(
+                merged[saved_col].notna() & (merged[saved_col] != ""),
+                merged[col]
+            )
+            merged.drop(columns=[saved_col], inplace=True)
+    merged.to_csv(annot_path, index=False)
+    n_filled = int((merged["annotation"].notna() & (merged["annotation"] != "")).sum())
+    print(f"Updated {annot_path}: {n_filled}/{len(merged)} annotated")
+else:
+    annot_df.to_csv(annot_path, index=False)
+    print(f"Wrote annotation template: {annot_path}  ({len(annot_df)} rows)")
+
+print(f"\nValid annotation values: {ANNOTATION_OPTIONS}")
+print("Fill the 'annotation' column in Excel, then re-run downstream notebooks.")
+print("\nFirst few rows:")
+print(annot_df[["filename", "fixation_type", "frame_index",
+                "em_filter_nm", "annotation"]].head(10).to_string())
+
+# %% [markdown]
+# ### Step 12b: Side-by-side intensity browser
+#
+# Loop through matching positions (same session + sample_index + frame_index) and display
+# transmitted-light (TD), 457/50 nm, and 535/50 nm intensity images side by side.
+# Use this to decide the "annotation" label for each position.
+#
+# Tip: run this once, keep the figure window open, then fill position_annotation.csv.
+
+# %%
+def _channel_label(em_nm) -> str:
+    """Return TD / 457 / 535 / or numeric label from em_filter_nm."""
+    if pd.isna(em_nm):
+        return "unknown"
+    s = str(em_nm).upper()
+    if "TD" in s or "TRANS" in s:
+        return "TD"
+    try:
+        v = float(em_nm)
+        if 450 <= v <= 465:
+            return "457"
+        if 528 <= v <= 545:
+            return "535"
+        return f"{int(v)}nm"
+    except (ValueError, TypeError):
+        return s[:8]
+
+
+sample_sdt = sdt_df[sdt_df["file_type"] == "sample"].copy()
+sample_sdt["_ch"] = sample_sdt["em_filter_nm"].apply(_channel_label)
+
+_group_cols = [c for c in ["session_root", "sample_index", "frame_index"]
+               if c in sample_sdt.columns]
+grouped = sample_sdt.groupby(_group_cols, dropna=False)
+print(f"Positions found: {len(grouped)}\n")
+
+_CH_ORDER = ["TD", "457", "535"]
+
+for pos_key, grp in grouped:
+    ch_map = {}
+    for _, row in grp.iterrows():
+        ch = row["_ch"]
+        if ch not in ch_map:        # keep first occurrence per channel
+            ch_map[ch] = row
+
+    present = [c for c in _CH_ORDER if c in ch_map]
+    present += [c for c in ch_map if c not in _CH_ORDER]
+    if not present:
+        continue
+
+    pos_str = " / ".join(
+        str(k) for k in (pos_key if isinstance(pos_key, tuple) else (pos_key,))
+    )
+
+    fig, axes = plt.subplots(1, len(present),
+                             figsize=(4.5 * len(present), 4), squeeze=False)
+    axes = axes[0]
+    fig.suptitle(f"Position: {pos_str}", fontsize=9)
+
+    for ax, ch in zip(axes, present):
+        row = ch_map[ch]
+        try:
+            sdt_obj   = SdtFile(str(row["filepath"]))
+            intensity = sdt_obj.data[0].astype(float).sum(axis=2)
+            pos_pix   = intensity[intensity > 0]
+            vmax      = float(np.percentile(pos_pix, 99)) if pos_pix.size > 0 else 1.0
+            ax.imshow(intensity, cmap="inferno", vmin=0, vmax=vmax)
+        except Exception as exc:
+            ax.text(0.5, 0.5, f"load error:\n{exc}",
+                    transform=ax.transAxes, ha="center", va="center",
+                    fontsize=7, color="red")
+        fn_short = str(row.get("filename", ""))[:40]
+        ax.set_title(f"{ch}\n{fn_short}", fontsize=7)
+        ax.axis("off")
+
+    plt.tight_layout()
+    plt.show()
+    fn_list = [ch_map[c]["filename"] for c in present]
+    print(f"  {pos_str}  ->  {fn_list}")
 
 # %% [markdown]
 # ## Summary
 #
 # At this point you have confirmed:
-# - Which fit parameters are available per fixation type
+# - Which fit parameters are available per fixation type (using fit_map.csv)
+# - best_fit_key() selects preferred n_components per fixation type
 # - Shift is zero (or flagged if not)
-# - Orientation transform needed to align .asc arrays with SDT pixels
-# - Chi^2 distribution and spatial pattern (used for quality masking in Phase E)
+# - Orientation: SDT and SPCImage exports are already aligned (ORIENTATION_TRANSFORM = None)
+# - Chi^2 distribution and spatial pattern paired with intensity image
 # - tau and amplitude distributions per fixation type
 # - Amplitude ratio maps: a2/(a2+a3) for glu, a1/(a1+a2) for form/live
 #
-# Saved: results/chi2_summary.csv
+# Inputs read:
+#   results/sdt_metadata_cal.csv
+#   results/filepath_map.csv
+#   results/fit_map.csv  -- fit-set/SDT pairs with n_components (written by Phase A)
 #
-# Next: Phase D -- calibrated phasor analysis per sample file
+# Saved:
+#   results/chi2_summary.csv
+#   results/position_annotation.csv  -- fill annotation column before Phase D
+#
+# Before Phase D:
+#   1. Fill in position_annotation.csv (single_cell / colony_deep / colony_edge /
+#      colony_island / no_cells / other)
+#   2. Thresholding (intensity mask per image) is Step 9 of Phase D

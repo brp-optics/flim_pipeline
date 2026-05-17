@@ -116,11 +116,14 @@ from datetime import datetime
 from sdtfile import SdtFile
 
 # -- Configuration ----------------------------------------------------------
-data_dirs = [ '/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260429_KPC_fixed_dishes_on_SLIM', '/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260501_KPC_fixed_dishes_on_SLIM']
+data_dirs = [ '/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260429_KPC_fixed_dishes_on_SLIM', 
+              '/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260501_KPC_fixed_dishes_on_SLIM',
+              '/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260509_KPC_fixed_dishes_on_SLIM']
 
 win_data_dirs = [
     Path("E:\\18_RK_Circadian\\data\\raw\\20260429_KPC_fixed_dishes_on_SLIM"),
     Path("E:\\18_RK_Circadian\\data\\raw\\20260501_KPC_fixed_dishes_on_SLIM"),
+    Path("E:\\18_RK_Circadian\\data\\raw\\20260509_KPC_fixed_dishes_on_SLIM"),
     ]
 
 current_os = "Win" ## Could we automate discovery of this?
@@ -408,6 +411,32 @@ for ft in sdt_df["file_type"].unique():
     print(subset[["filename", "cell_type", "fixation_type", "em_filter_nm"]].head(5).to_string())
 
 # %% [markdown]
+# ## Step 2c: Metadata corrections
+#
+# Known naming inconsistencies corrected here.
+# Add new corrections as they are discovered; document the reason.
+
+# %%
+# (1) Before session 20260509, files labelled "KPC" + live are actually KPCWT.
+_mask_kpc = (
+    (sdt_df["cell_type"] == "KPC") &
+    (sdt_df["fixation_type"] == "live") &
+    (sdt_df["session_date"] < "20260509")
+)
+sdt_df.loc[_mask_kpc, "cell_type"] = "KPCWT"
+print(f"(1) KPC+live -> KPCWT (pre-20260509): {_mask_kpc.sum()} files corrected")
+
+# (2) em_filter_nm 475 is a parsing artefact; correct to 457.
+_mask_475 = sdt_df["em_filter_nm"] == 475
+sdt_df.loc[_mask_475, "em_filter_nm"] = 457
+print(f"(2) em_filter_nm 475 -> 457: {_mask_475.sum()} files corrected")
+
+# (3) Position fallback: use frame_index when position is absent from filename.
+sdt_df["position"] = sdt_df["position"].fillna(sdt_df["frame_index"])
+print(f"(3) Position coverage after fallback: "
+      f"{sdt_df['position'].notna().sum()}/{len(sdt_df)} files")
+
+# %% [markdown]
 # **IRF source:** Urea slides serve as the IRF measurement for this instrument.
 # Files classified as `irf` above are the urea acquisitions.
 # SPCImage also exports fitted IRFs as `.irf` files (discovered in `irf_files`);
@@ -688,31 +717,45 @@ def _strip_param_suffix(stem: str) -> str:
 # %%
 print(f"Loading {len(asc_files)} .asc fit export files...")
 
-fit_data: dict[str, dict[str, np.ndarray | Path]] = {}
+# fit_data key: "{session_root}::{rel_dir}::{base_stem}"
+# This keeps different fit folders (1-comp, 2-comp, 3-comp) as separate entries
+# even when the base stem is identical.
+fit_data: dict[str, dict] = {}
 parse_failures = []
 
 for _, row in asc_files.iterrows():
+    # Skip SPCImage summary/statistics files -- they are text tables, not pixel grids
+    if re.search(r"_statistic", row["stem"], re.IGNORECASE):
+        continue
+
     result = load_spcimage_asc(row["filepath"])
     if result is None:
         parse_failures.append(row["filename"])
         continue
 
-    base = _strip_param_suffix(row["stem"])
-    if base not in fit_data:
-        fit_data[base] = {}
+    base        = _strip_param_suffix(row["stem"])
+    fit_set_key = f"{row['session_root']}::{row['rel_dir']}::{base}"
 
-    fit_data[base][result["param_name"]] = result["data"]
-    fit_data[base][f"_path_{result['param_name']}"] = result["filepath"]
+    if fit_set_key not in fit_data:
+        fit_data[fit_set_key] = {
+            "_session_root": row["session_root"],
+            "_folder":       row["rel_dir"],
+            "_base_stem":    base,
+        }
+    fit_data[fit_set_key][result["param_name"]]           = result["data"]
+    fit_data[fit_set_key][f"_path_{result['param_name']}"] = result["filepath"]
 
-print(f"Grouped into {len(fit_data)} image sets")
+n_stat_skipped = sum(1 for _, r in asc_files.iterrows()
+                     if re.search(r"_statistic", r["stem"], re.IGNORECASE))
+print(f"Grouped into {len(fit_data)} fit sets  "
+      f"({n_stat_skipped} statistics files skipped, {len(parse_failures)} parse failures)")
 if parse_failures:
-    print(f"  {len(parse_failures)} files failed to parse: {parse_failures[:10]}")
+    print(f"  Failed: {parse_failures[:5]}")
 
-print("\nFirst few image sets:")
-for base, params in list(fit_data.items())[:8]:
+print("\nFirst few fit sets:")
+for key, params in list(fit_data.items())[:8]:
     param_names = sorted(k for k in params if not k.startswith("_"))
-    shapes = [str(params[k].shape) for k in param_names]
-    print(f"  {base}: {', '.join(f'{n} {s}' for n, s in zip(param_names, shapes))}")
+    print(f"  [{params['_folder']}] {params['_base_stem']}: {', '.join(param_names)}")
 
 
 # %% [markdown]
@@ -723,50 +766,93 @@ for base, params in list(fit_data.items())[:8]:
 # the SDT (we don't care about mtime on the `.asc` files themselves).
 
 # %%
-def match_fits_to_sdt(sdt_df: pd.DataFrame, fit_data: dict) -> pd.DataFrame:
+def match_fits_to_sdt(sdt_df: pd.DataFrame,
+                      fit_data: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Match ascii fit export groups to SDT files by filename stem similarity.
+    Match ALL available fit sets to each SDT file by session + stem similarity.
 
-    Adds columns: has_fit_export, fit_params_available, fit_base_stem.
+    Returns (sdt_df_updated, fit_map_df).
+
+    sdt_df_updated gains:
+      has_fit_export      -- True if any fit set matched
+      fit_base_stem       -- first matching fit_set_key (backward-compat)
+      fit_params_available-- params of the first match
+      n_fit_sets          -- total number of matched fit sets
+      fit_set_keys        -- comma-separated list of all matching fit_set_keys
+
+    fit_map_df columns: sdt_filename, fit_set_key, fit_folder, n_components,
+                        params_available
     """
+    # Per-session lookup: base_stem_lower -> [fit_set_keys]
+    sess_lookup: dict[str, dict[str, list]] = {}
+    for key, fd in fit_data.items():
+        sess  = fd.get("_session_root", "")
+        base  = fd.get("_base_stem", "").lower()
+        sess_lookup.setdefault(sess, {}).setdefault(base, []).append(key)
+
     df = sdt_df.copy()
-    df["has_fit_export"] = False
-    df["fit_params_available"] = None
-    df["fit_base_stem"] = None
+    df["has_fit_export"]      = False
+    df["fit_base_stem"]       = None
+    df["fit_params_available"]= None
+    df["n_fit_sets"]          = 0
+    df["fit_set_keys"]        = None
 
-    # Build lookup: lowered base stems -> original key
-    fit_lookup = {k.lower(): k for k in fit_data}
+    fit_map_rows = []
 
     for idx, row in df.iterrows():
-        sdt_stem = row["stem"].lower()
+        sess      = row.get("session_root", "")
+        sdt_lower = row["stem"].lower()
 
-        # Try exact match
-        if sdt_stem in fit_lookup:
-            match_key = fit_lookup[sdt_stem]
-        else:
-            # Try containment: sdt stem starts with or contains a fit base
-            match_key = None
-            for base_lower, base_orig in fit_lookup.items():
-                if base_lower in sdt_stem or sdt_stem in base_lower:
-                    match_key = base_orig
-                    break
+        matches = []
+        for base_lower, keys in sess_lookup.get(sess, {}).items():
+            if base_lower in sdt_lower or sdt_lower.startswith(base_lower):
+                matches.extend(keys)
 
-        if match_key:
-            param_names = sorted(k for k in fit_data[match_key] if not k.startswith("_"))
-            df.at[idx, "has_fit_export"] = True
-            df.at[idx, "fit_params_available"] = ", ".join(param_names)
-            df.at[idx, "fit_base_stem"] = match_key
+        # Deduplicate, preserve order
+        seen, matches = set(), [k for k in matches
+                                 if not (k in seen or seen.add(k))]
+        if not matches:
+            continue
 
-    return df
+        first_fd     = fit_data[matches[0]]
+        first_params = sorted(k for k in first_fd if not k.startswith("_"))
+
+        df.at[idx, "has_fit_export"]       = True
+        df.at[idx, "fit_base_stem"]        = matches[0]
+        df.at[idx, "fit_params_available"] = ", ".join(first_params)
+        df.at[idx, "n_fit_sets"]           = len(matches)
+        df.at[idx, "fit_set_keys"]         = ",".join(matches)
+
+        for fit_key in matches:
+            fd     = fit_data[fit_key]
+            params = sorted(k for k in fd if not k.startswith("_"))
+            n_comp = sum(1 for p in ("tau1", "tau2", "tau3") if p in fd)
+            fit_map_rows.append({
+                "sdt_filename":    row["filename"],
+                "fit_set_key":     fit_key,
+                "fit_folder":      fd.get("_folder", ""),
+                "n_components":    n_comp,
+                "params_available": ", ".join(params),
+            })
+
+    return df, pd.DataFrame(fit_map_rows)
 
 
-sdt_df = match_fits_to_sdt(sdt_df, fit_data)
+sdt_df, fit_map_df = match_fits_to_sdt(sdt_df, fit_data)
 
 n_with_fits = sdt_df["has_fit_export"].sum()
-n_samples = (sdt_df["file_type"] == "sample").sum()
+n_samples   = (sdt_df["file_type"] == "sample").sum()
 print(f"=== Fit export matching ===")
-print(f"  {n_with_fits} / {len(sdt_df)} total SDT files have matching fit exports")
-print(f"  {sdt_df.loc[sdt_df['file_type'] == 'sample', 'has_fit_export'].sum()} / {n_samples} sample files")
+print(f"  {n_with_fits} / {len(sdt_df)} total SDT files have at least one fit set")
+print(f"  {sdt_df.loc[sdt_df['file_type'] == 'sample', 'has_fit_export'].sum()} "
+      f"/ {n_samples} sample files")
+if n_with_fits:
+    ns = sdt_df.loc[sdt_df["has_fit_export"], "n_fit_sets"]
+    print(f"  Fit sets per matched file: min={ns.min()}  max={ns.max()}  "
+          f"mean={ns.mean():.1f}")
+print(f"\n  n_components distribution across all fit sets:")
+if not fit_map_df.empty:
+    print(fit_map_df["n_components"].value_counts().sort_index().to_string())
 
 unmatched = sdt_df[(sdt_df["file_type"] == "sample") & (~sdt_df["has_fit_export"])]
 if len(unmatched):
@@ -853,14 +939,19 @@ def load_decay(filepath: Path, channel: int = 0, use_cache: bool = True) -> tupl
     return sdt.data[channel], sdt.times[channel]
 
 
-def get_fit_arrays(row: pd.Series) -> dict[str, np.ndarray] | None:
-    """Get fit parameter arrays for a given SDT file row, or None."""
+def get_fit_arrays(row: pd.Series,
+                   fit_set_key: str = None) -> dict[str, np.ndarray] | None:
+    """Get fit parameter arrays for a given SDT file row, or None.
+
+    fit_set_key: specific key from fit_map_df; defaults to fit_base_stem (first match).
+    Use fit_map_df to enumerate all available fit sets for a file.
+    """
     if not row.get("has_fit_export"):
         return None
-    base = row["fit_base_stem"]
-    if base not in fit_data:
+    key = fit_set_key or row.get("fit_base_stem")
+    if not isinstance(key, str) or key not in fit_data:
         return None
-    return {k: v for k, v in fit_data[base].items() if not k.startswith("_")}
+    return {k: v for k, v in fit_data[key].items() if not k.startswith("_")}
 
 
 def get_row(df: pd.DataFrame, filename: str = None, idx: int = None) -> pd.Series:
@@ -905,6 +996,11 @@ fp_map = sdt_df[["filename", "session_root"]].copy()
 fp_map["filepath"] = sdt_df["filepath"].astype(str)
 fp_map.to_csv(output_dir / "filepath_map.csv", index=False)
 print(f"Saved filepath map to {output_dir / 'filepath_map.csv'}")
+
+# Save fit map: one row per (SDT file, fit set) -- used in Phase E to select fit model
+fit_map_df.to_csv(output_dir / "fit_map.csv", index=False)
+print(f"Saved fit map to {output_dir / 'fit_map.csv'} "
+      f"({len(fit_map_df)} fit-set/SDT pairs)")
 
 # %% [markdown]
 # ## Verification: raw SDT headers vs parsed DataFrame
