@@ -46,6 +46,10 @@ PHASOR_BLUR_SIGMA = 2.0
 # Emission filters to include in phasor analysis
 PHASOR_EM_FILTERS = [457, 535]
 
+# Column order for cell_type in plots (left to right).
+# Any cell types not listed here are appended in sorted order after.
+CELL_TYPE_ORDER = ["WT", "BKO"]
+
 # Annotation groups to merge before plotting (rhs label is what appears in plots)
 ANNOTATION_REMAP = {
     "colony_island": "colony_edge+island",
@@ -713,7 +717,9 @@ _CT_COLORS = plt.cm.tab10.colors
 for (fix_type, em_nm), grp in plot_df.groupby(
     ["fixation_type", "em_filter_nm"], dropna=False
 ):
-    cell_types  = sorted(grp["cell_type"].dropna().unique())
+    _present    = set(grp["cell_type"].dropna().unique())
+    cell_types  = [ct for ct in CELL_TYPE_ORDER if ct in _present] + \
+                  sorted(_present - set(CELL_TYPE_ORDER))
     annotations = sorted(grp["position_annotation"].unique())
 
     annot_rows = ["(all)"] + [a for a in annotations if a != "(all)"]

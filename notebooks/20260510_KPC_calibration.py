@@ -18,10 +18,11 @@ from sdtfile import SdtFile
 # -- Configuration ----------------------------------------------------------
 REP_RATE_HZ        = 80e6           # laser repetition rate
 OMEGA              = 2 * np.pi * REP_RATE_HZ
-CHROMA_TAU_REF_NS  = 0.980          # chromablue reference lifetime (ns)
+CHROMA_TAU_REF_NS  = 0.960          # chromablue reference lifetime (ns)
                                     # range observed: 0.80-1.10 ns with urea IRF;
-                                    # set to 0.980 based on urea phasor check:
-                                    # calibrated urea mean was (1.004, 0.021) with 1.000 ns
+                                    # 1.000 ns -> urea at (1.004, 0.021)
+                                    # 0.980 ns -> urea at (1.007, 0.013)
+                                    # trying 0.960 ns to bring S closer to 0
 IRF_CLUSTER_WIN_MIN = 10            # consecutive urea measurements within this
                                     # many minutes -> keep only the later one
 IRF_PEAK_WARN_BINS  = 1             # warn if IRF peak shifts more than this many bins
