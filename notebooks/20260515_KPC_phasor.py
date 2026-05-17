@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from scipy.ndimage import gaussian_filter
 from sdtfile import SdtFile
 
 # -- Configuration ----------------------------------------------------------
@@ -33,8 +34,25 @@ OMEGA       = 2.0 * np.pi * REP_RATE_HZ   # angular frequency (rad/s)
 # Intensity mask: minimum fraction kept when Otsu gives degenerate result
 MASK_FALLBACK_FRAC = 0.50    # keep top 50% of pixels by photon count
 
+# Gaussian blur sigma applied to photon image before Otsu thresholding.
+# Smooths shot noise so the threshold follows cell-level structure.
+# sigma = FWHM / 2.355; 5-pixel FWHM -> sigma ~ 2.1
+MASK_BLUR_SIGMA = 2.0
+
+# Gaussian blur sigma for phasor smoothing (photon-weighted, spatial domain).
+# Applied to G and S maps before plotting; does not affect per-file summary stats.
+PHASOR_BLUR_SIGMA = 2.0
+
 # Emission filters to include in phasor analysis
 PHASOR_EM_FILTERS = [457, 535]
+
+# Annotation groups to merge before plotting (rhs label is what appears in plots)
+ANNOTATION_REMAP = {
+    "colony_island": "colony_edge+island",
+    "colony_edge":   "colony_edge+island",
+}
+# Annotation groups to exclude from plots entirely
+ANNOTATION_EXCLUDE = {"no_cells", "(unannotated)"}
 
 # %%
 # -- Load Phase A/B outputs -------------------------------------------------
@@ -137,22 +155,43 @@ def otsu_threshold(img: np.ndarray) -> float:
 
 
 def intensity_mask(photon_img: np.ndarray,
-                   fallback_frac: float = MASK_FALLBACK_FRAC):
+                   fallback_frac: float = MASK_FALLBACK_FRAC,
+                   blur_sigma: float = MASK_BLUR_SIGMA):
     """Return (bool mask, threshold).  True = keep pixel.
 
-    Uses Otsu on the photon count image.  Falls back to top-percentile if
-    Otsu keeps <5% or >95% of pixels.
+    Applies a Gaussian blur (sigma=blur_sigma) before Otsu so the threshold
+    follows cell-level structure rather than per-pixel shot noise.
+    Falls back to top-percentile if Otsu keeps <5% or >95% of pixels.
     """
-    thresh = otsu_threshold(photon_img)
-    mask   = photon_img >= thresh
-    frac   = mask.sum() / float(mask.size)
+    blurred = gaussian_filter(photon_img.astype(float), sigma=blur_sigma)
+    thresh  = otsu_threshold(blurred)
+    mask    = blurred >= thresh
+    frac    = mask.sum() / float(mask.size)
     if frac < 0.05 or frac > 0.95:
         lo     = float(np.nanpercentile(
-            photon_img[photon_img > 0], 100.0 * (1.0 - fallback_frac)
+            blurred[blurred > 0], 100.0 * (1.0 - fallback_frac)
         ))
         thresh = lo
-        mask   = photon_img >= lo
+        mask   = blurred >= lo
     return mask, thresh
+
+
+def smooth_phasor(G_cal: np.ndarray, S_cal: np.ndarray,
+                  photons: np.ndarray,
+                  sigma: float = PHASOR_BLUR_SIGMA) -> tuple:
+    """Photon-weighted Gaussian smoothing of G and S in spatial domain.
+
+    Filters G*photons and photons separately before dividing, which is
+    equivalent to averaging the underlying TCSPC decays over a local
+    neighbourhood.  Returns (G_sm, S_sm) with NaN where photons == 0.
+    """
+    ph     = np.nan_to_num(photons, nan=0.0)
+    G_num  = np.nan_to_num(G_cal * photons, nan=0.0)
+    S_num  = np.nan_to_num(S_cal * photons, nan=0.0)
+    ph_sm  = gaussian_filter(ph,    sigma=sigma)
+    G_sm   = np.where(ph_sm > 0, gaussian_filter(G_num, sigma=sigma) / ph_sm, np.nan)
+    S_sm   = np.where(ph_sm > 0, gaussian_filter(S_num, sigma=sigma) / ph_sm, np.nan)
+    return G_sm, S_sm
 
 
 # -- Demo: show masks for one file per (fixation_type, em_filter_nm) --------
@@ -279,9 +318,12 @@ def load_phasor(row: pd.Series) -> dict | None:
     G_cal, S_cal          = apply_phasor_cal(G_raw, S_raw,
                                              float(phase_corr), float(mod_corr))
     mask, thresh = intensity_mask(photons)
+    G_sm, S_sm   = smooth_phasor(G_cal, S_cal, photons)
     return {
-        "G_cal":   G_cal,
+        "G_cal":   G_cal,    # raw calibrated phasor (used for summary stats)
         "S_cal":   S_cal,
+        "G_sm":    G_sm,     # spatially smoothed phasor (used for plots)
+        "S_sm":    S_sm,
         "photons": photons,
         "mask":    mask,
         "thresh":  thresh,
@@ -317,11 +359,12 @@ for _, row in sample_df.sort_values("acquisition_time").iterrows():
     shown.add(gkey)
 
     G_cal, S_cal = result["G_cal"], result["S_cal"]
+    G_sm,  S_sm  = result.get("G_sm", G_cal), result.get("S_sm", S_cal)
     photons, mask = result["photons"], result["mask"]
-    valid = mask & np.isfinite(G_cal) & np.isfinite(S_cal)
+    valid = mask & np.isfinite(G_sm) & np.isfinite(S_sm)
 
-    G_plot = G_cal[valid].ravel()
-    S_plot = S_cal[valid].ravel()
+    G_plot = G_sm[valid].ravel()    # smoothed for display
+    S_plot = S_sm[valid].ravel()
     w_plot = photons[valid].ravel()
 
     fig, axes = plt.subplots(1, 3, figsize=(16, 5))
@@ -370,6 +413,146 @@ for _, row in sample_df.sort_values("acquisition_time").iterrows():
         S_wm = float(np.average(S_plot, weights=w_plot))
         print(f"  G_cal wmean={G_wm:.4f}   S_cal wmean={S_wm:.4f}"
               f"   n_px={valid.sum()}")
+
+# %% [markdown]
+# ## Step 11b: Urea (IRF) calibration check
+#
+# Urea crystals are pure scatter -- their effective lifetime is ~0 ns.
+# In calibrated phasor space a tau=0 source must land at (G=1, S=0),
+# the right endpoint of the universal semicircle.
+#
+# If the cluster of urea phasors is visibly rotated away from (1, 0)
+# after applying the chromabead calibration, the reference lifetime
+# CHROMA_TAU_REF_NS in Phase B is wrong and needs re-fitting.
+#
+# Note: phasor analysis assumes the laser pulse is at t=0 of the time axis.
+# Any fixed time-offset appears as a phase rotation in the raw phasor; the
+# chromabead calibration is supposed to correct for it. A urea cloud sitting
+# away from (1, 0) means that correction is incomplete.
+
+# %%
+irf_df = sdt_df[sdt_df["file_type"] == "irf"].copy()
+print(f"IRF (urea) files found: {len(irf_df)}")
+
+if irf_df.empty:
+    print("No IRF files -- skipping calibration check.")
+else:
+    # Calibration lookup: for each urea file, find the sample file in the same
+    # session with the nearest acquisition_time and use its cal values.
+    # This approximates "calibrated by the adjacent chroma" without re-reading
+    # the raw chromabead phasors from Phase B.
+    cal_pool = (
+        sample_df[["session_root", "acquisition_time",
+                   "phasor_cal_phase_rad", "phasor_cal_mod"]]
+        .dropna(subset=["phasor_cal_phase_rad", "phasor_cal_mod"])
+        .sort_values("acquisition_time")
+        .copy()
+    )
+    cal_pool["acquisition_time"] = pd.to_datetime(cal_pool["acquisition_time"])
+
+    def _nearest_cal(session, acq_time):
+        pool = cal_pool[cal_pool["session_root"] == session]
+        if pool.empty:
+            return None, None
+        dt = (pool["acquisition_time"] - pd.to_datetime(acq_time)).abs()
+        best = pool.iloc[dt.argmin()]
+        return float(best["phasor_cal_phase_rad"]), float(best["phasor_cal_mod"])
+
+    # Compute per-file mean phasor (intensity-weighted over all pixels)
+    records = []
+    for _, row in irf_df.iterrows():
+        fp = row.get("filepath")
+        if pd.isna(fp) or not Path(str(fp)).exists():
+            continue
+        session  = row.get("session_root", "")
+        acq_time = row.get("acquisition_time")
+        phase_corr, mod_corr = _nearest_cal(session, acq_time)
+        if phase_corr is None:
+            continue
+        try:
+            sdt_obj   = SdtFile(str(fp))
+            decay_raw = sdt_obj.data[0].astype(float)
+        except Exception as exc:
+            print(f"  Load failed: {row['filename']}: {exc}")
+            continue
+
+        time_ns          = _get_time_ns(sdt_obj, decay_raw.shape[2])
+        G_raw, S_raw, ph = compute_phasor_raw(decay_raw, time_ns)
+        G_cal, S_cal     = apply_phasor_cal(G_raw, S_raw, phase_corr, mod_corr)
+
+        ok = np.isfinite(G_cal) & np.isfinite(S_cal) & (ph > 0)
+        if not ok.any():
+            continue
+        w = ph[ok]
+        wtot = float(w.sum())
+        records.append({
+            "filename":    row["filename"],
+            "session":     session,
+            "acq_time":    acq_time,
+            "phase_corr":  phase_corr,
+            "mod_corr":    mod_corr,
+            "G_raw_wmean": float(np.average(G_raw[ok], weights=w)),
+            "S_raw_wmean": float(np.average(S_raw[ok], weights=w)),
+            "G_cal_wmean": float(np.average(G_cal[ok], weights=w)),
+            "S_cal_wmean": float(np.average(S_cal[ok], weights=w)),
+        })
+
+    if not records:
+        print("No urea files could be loaded/calibrated.")
+    else:
+        urea_df = pd.DataFrame(records)
+        urea_df["dist_from_10"] = np.sqrt(
+            (urea_df["G_cal_wmean"] - 1.0) ** 2 + urea_df["S_cal_wmean"] ** 2
+        )
+
+        # Per-session summary table
+        print("\nPer-session urea calibration check (should be near G=1, S=0):")
+        tbl = urea_df.groupby("session")[
+            ["G_raw_wmean", "S_raw_wmean", "G_cal_wmean", "S_cal_wmean", "dist_from_10"]
+        ].agg(["mean", "std"]).round(4)
+        print(tbl.to_string())
+
+        print(f"\nAll-session mean calibrated urea: "
+              f"G={urea_df['G_cal_wmean'].mean():.4f}  "
+              f"S={urea_df['S_cal_wmean'].mean():.4f}  "
+              f"dist={urea_df['dist_from_10'].mean():.4f}")
+
+        # Scatter plot: one point per urea file
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+        for ax in axes:
+            draw_semicircle(ax)
+            ax.axvline(1.0, color="lime", lw=0.8, alpha=0.4)
+            ax.axhline(0.0, color="lime", lw=0.8, alpha=0.4)
+            ax.plot(1.0, 0.0, "g*", ms=14, label="expected (1, 0)", zorder=5)
+            ax.set_xlim(-0.05, 1.15)
+            ax.set_ylim(-0.1, 0.6)
+            ax.set_aspect("equal")
+
+        sessions = sorted(urea_df["session"].unique())
+        colors   = plt.cm.tab10.colors
+        for ax, xcol, ycol, title in zip(
+            axes,
+            ["G_raw_wmean", "G_cal_wmean"],
+            ["S_raw_wmean", "S_cal_wmean"],
+            ["raw (uncalibrated)", "calibrated -- should be at (1, 0)"],
+        ):
+            for i, sess in enumerate(sessions):
+                sub = urea_df[urea_df["session"] == sess]
+                ax.scatter(sub[xcol], sub[ycol],
+                           color=colors[i % len(colors)],
+                           s=60, zorder=4, label=sess)
+            ax.legend(fontsize=7, loc="upper left")
+            ax.set_xlabel("G")
+            ax.set_ylabel("S")
+            ax.set_title(f"Urea per-file mean -- {title}", fontsize=9)
+
+        plt.suptitle(
+            "Urea (IRF) calibration check  |  each point = one urea file  |  "
+            "calibrated target = (1, 0)",
+            fontsize=10,
+        )
+        plt.tight_layout()
+        plt.show()
 
 # %% [markdown]
 # ## Step 12: Per-file phasor summary
@@ -470,7 +653,7 @@ print(f"\nSaved: {results_dir / 'sdt_phasor_summary.csv'}")
 def _phasor_hexbin_ax(ax, filenames, phasor_cache,
                       gridsize: int = 50, cmap: str = "plasma") -> int:
     """
-    Fill ax with a photon-weighted hexbin phasor plot.
+    Fill ax with a photon-weighted hexbin phasor plot using smoothed G/S.
     Returns the number of valid files plotted.
     """
     all_G, all_S, all_w = [], [], []
@@ -479,13 +662,15 @@ def _phasor_hexbin_ax(ax, filenames, phasor_cache,
         result = phasor_cache.get(fn)
         if result is None:
             continue
-        G_cal, S_cal = result["G_cal"], result["S_cal"]
+        # Use smoothed phasor for display; fall back to raw if smoothing failed
+        G_plot = result.get("G_sm", result["G_cal"])
+        S_plot = result.get("S_sm", result["S_cal"])
         photons, mask = result["photons"], result["mask"]
-        valid = mask & np.isfinite(G_cal) & np.isfinite(S_cal)
+        valid = mask & np.isfinite(G_plot) & np.isfinite(S_plot)
         if not valid.any():
             continue
-        all_G.append(G_cal[valid].ravel())
-        all_S.append(S_cal[valid].ravel())
+        all_G.append(G_plot[valid].ravel())
+        all_S.append(S_plot[valid].ravel())
         all_w.append(photons[valid].ravel())
         n_plotted += 1
 
@@ -499,50 +684,95 @@ def _phasor_hexbin_ax(ax, filenames, phasor_cache,
                        gridsize=gridsize, cmap=cmap, mincnt=1)
         plt.colorbar(hb, ax=ax, label="photons", fraction=0.046, pad=0.04)
 
-    ax.set_xlabel("G")
-    ax.set_ylabel("S")
-    ax.set_aspect("equal", adjustable="datalim")
+    ax.set_xlabel("G (calibrated)")
+    ax.set_ylabel("S (calibrated)")
+    ax.set_xlim(-0.05, 1.05)
+    ax.set_ylim(-0.05, 0.55)
+    ax.set_aspect("equal")
     return n_plotted
 
 
-for (fix_type, em_nm), grp in sample_df.groupby(
+# Apply annotation remap and exclusions for plotting
+plot_df = sample_df.copy()
+plot_df["position_annotation"] = (
+    plot_df["position_annotation"].replace(ANNOTATION_REMAP)
+)
+plot_df = plot_df[~plot_df["position_annotation"].isin(ANNOTATION_EXCLUDE)]
+
+# Apply same remap to phasor summary so mean scatter uses consistent labels
+plot_phasor_df = phasor_df.copy()
+plot_phasor_df["position_annotation"] = (
+    plot_phasor_df["position_annotation"].replace(ANNOTATION_REMAP)
+)
+plot_phasor_df = plot_phasor_df[
+    ~plot_phasor_df["position_annotation"].isin(ANNOTATION_EXCLUDE)
+]
+
+_CT_COLORS = plt.cm.tab10.colors
+
+for (fix_type, em_nm), grp in plot_df.groupby(
     ["fixation_type", "em_filter_nm"], dropna=False
 ):
     cell_types  = sorted(grp["cell_type"].dropna().unique())
     annotations = sorted(grp["position_annotation"].unique())
 
-    # Always include an "(all)" row at the top
     annot_rows = ["(all)"] + [a for a in annotations if a != "(all)"]
-
     n_rows = len(annot_rows)
     n_cols = max(len(cell_types), 1)
 
+    # -- Hexbin grid (per-pixel, smoothed) -----------------------------------
     fig, axes = plt.subplots(n_rows, n_cols,
                              figsize=(5.5 * n_cols, 5.0 * n_rows),
                              squeeze=False)
 
     for r_idx, annot in enumerate(annot_rows):
-        if annot == "(all)":
-            sub = grp
-        else:
-            sub = grp[grp["position_annotation"] == annot]
+        sub = grp if annot == "(all)" else grp[grp["position_annotation"] == annot]
 
         for c_idx, ct in enumerate(cell_types if cell_types else [None]):
             ax = axes[r_idx][c_idx]
-
-            if ct is not None:
-                cell_sub = sub[sub["cell_type"] == ct]
-                ct_label = ct
-            else:
-                cell_sub = sub
-                ct_label = "all"
-
-            fns = cell_sub["filename"].tolist()
+            cell_sub = sub[sub["cell_type"] == ct] if ct is not None else sub
+            ct_label = ct if ct is not None else "all"
+            fns      = cell_sub["filename"].tolist()
             n_plotted = _phasor_hexbin_ax(ax, fns, phasor_cache)
-
             ax.set_title(f"{ct_label}  n={n_plotted}\n{annot}", fontsize=8)
 
-    fig.suptitle(f"Phasor  {fix_type} / {em_nm} nm", fontsize=12)
+    fig.suptitle(f"Phasor (per-pixel, smoothed)  {fix_type} / {em_nm} nm",
+                 fontsize=11)
+    plt.tight_layout()
+    plt.show()
+
+    # -- Per-file mean phasor scatter ----------------------------------------
+    ps_grp = plot_phasor_df[
+        (plot_phasor_df["fixation_type"] == fix_type) &
+        (plot_phasor_df["em_filter_nm"]  == em_nm)
+    ]
+    if ps_grp.empty:
+        continue
+
+    fig2, ax2 = plt.subplots(figsize=(6, 5))
+    draw_semicircle(ax2)
+
+    for i, ct in enumerate(cell_types if cell_types else [None]):
+        ct_sub = ps_grp[ps_grp["cell_type"] == ct] if ct is not None else ps_grp
+        color  = _CT_COLORS[i % len(_CT_COLORS)]
+        for annot, ann_sub in ct_sub.groupby("position_annotation", dropna=False):
+            ax2.scatter(
+                ann_sub["G_cal_wmean"], ann_sub["S_cal_wmean"],
+                color=color, label=f"{ct} / {annot}" if ct else str(annot),
+                s=35, alpha=0.75, edgecolors="none",
+            )
+
+    ax2.set_xlabel("G_cal (per-file wmean)")
+    ax2.set_ylabel("S_cal (per-file wmean)")
+    ax2.set_xlim(-0.05, 1.05)
+    ax2.set_ylim(-0.05, 0.55)
+    ax2.set_aspect("equal")
+    ax2.legend(fontsize=7, loc="upper left")
+    ax2.set_title(
+        f"Per-file mean phasor  {fix_type} / {em_nm} nm  "
+        f"(n={len(ps_grp)} files)",
+        fontsize=9,
+    )
     plt.tight_layout()
     plt.show()
 

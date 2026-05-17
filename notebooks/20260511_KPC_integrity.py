@@ -20,10 +20,12 @@ from sdtfile import SdtFile
 WIN_DATA_DIRS = [
     Path(r"E:\18_RK_Circadian\data\raw\20260429_KPC_fixed_dishes_on_SLIM"),
     Path(r"E:\18_RK_Circadian\data\raw\20260501_KPC_fixed_dishes_on_SLIM"),
+    Path(r"E:\18_RK_Circadian\data\raw\20260509_KPC_fixed_dishes_on_SLIM"),
 ]
 LIN_DATA_DIRS = [
     Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260429_KPC_fixed_dishes_on_SLIM"),
     Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260501_KPC_fixed_dishes_on_SLIM"),
+    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260509_KPC_fixed_dishes_on_SLIM"),
 ]
 CURRENT_OS = "Win"
 data_dirs = WIN_DATA_DIRS if CURRENT_OS == "Win" else LIN_DATA_DIRS
@@ -61,9 +63,11 @@ fp_map = pd.read_csv(results_dir / "filepath_map.csv")
 # Keep first occurrence per filename to avoid fan-out in the merge.
 fp_map = fp_map.drop_duplicates(subset="filename", keep="first")
 sdt_df = sdt_df.merge(fp_map[["filename", "filepath"]], on="filename", how="left")
-# Drop any remaining full-row duplicates (e.g. from sdt_metadata_cal itself).
+# Drop duplicates: first by full row (catches exact copies), then by filename
+# (catches near-duplicates where rows differ only in a metadata column).
 n_before = len(sdt_df)
 sdt_df = sdt_df.drop_duplicates()
+sdt_df = sdt_df.drop_duplicates(subset="filename", keep="first")
 if len(sdt_df) < n_before:
     print(f"Dropped {n_before - len(sdt_df)} duplicate rows after merge.")
 sdt_df["filepath"]         = sdt_df["filepath"].map(Path)
