@@ -25,6 +25,16 @@ from scipy import stats
 CELL_TYPE_ORDER = ["KPCWT", "BKO", "DKO"]
 FIXATION_ORDER  = ["glu", "form", "live"]
 
+# Figure output
+FIGURES_DIR  = Path("../results/figures")
+SAVE_FIGURES = True   # set False to skip saving
+
+
+def _savefig(fig, name: str) -> None:
+    if SAVE_FIGURES:
+        FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+        fig.savefig(FIGURES_DIR / f"{name}.png", dpi=150, bbox_inches="tight")
+
 # Minimum images per group to include in statistical tests
 MIN_N = 3
 
@@ -37,7 +47,7 @@ PHASOR_METRICS = ["tau_phi_ns", "tau_mod_ns", "G_cal_wmean", "S_cal_wmean"]
 
 METRIC_LABELS = {
     "tau_mean_median_ps": "tau_mean median (ps)",
-    "amp_ratio_median":   "amplitude ratio (median)",
+    "amp_ratio_median":   "a1/a2 ratio (median)",
     "tau_phi_ns":         "tau_phi (ns)",
     "tau_mod_ns":         "tau_mod (ns)",
     "G_cal_wmean":        "G_cal (photon-weighted mean)",
@@ -146,6 +156,7 @@ else:
                                bbox_to_anchor=(1.02, 1), loc="upper left")
         plt.suptitle(f"Photobleaching check -- {fix_type}", fontsize=10)
         plt.tight_layout()
+        _savefig(fig, f"fig_batch_check_{fix_type}")
         plt.show()
 
 # %% [markdown]
@@ -202,6 +213,7 @@ for metric in all_metrics:
 
     fig.suptitle(label, fontsize=11)
     plt.tight_layout()
+    _savefig(fig, f"fig_violin_{metric}")
     plt.show()
 
 # %% [markdown]
@@ -353,6 +365,7 @@ if not stat_df.empty:
     plt.suptitle("Effect size r (rank-biserial)   * = BH-FDR q < "
                  + str(FDR_ALPHA), fontsize=10)
     plt.tight_layout()
+    _savefig(fig, "fig_effect_size_heatmap")
     plt.show()
 
 # %% [markdown]
@@ -404,6 +417,7 @@ for y_col, x_col in xval_pairs:
                  f"Spearman r={r_sp:.3f}  p={p_sp:.2g}  n={len(sub)}")
     ax.legend(fontsize=8)
     plt.tight_layout()
+    _savefig(fig, f"fig_xval_{y_col}_vs_{x_col}")
     plt.show()
 
 # %% [markdown]
@@ -449,6 +463,189 @@ if not summary_df.empty:
 
 summary_df.to_csv(results_dir / "group_summary.csv", index=False)
 print(f"Saved: {results_dir / 'group_summary.csv'}")
+
+# %% [markdown]
+# ## Step 25: Per-channel comparison
+#
+# Violin plots of amplitude ratio and tau_mean faceted by emission channel
+# (em_filter_nm). Shows whether BKO vs KPCWT differences are consistent
+# across 457 nm (NADH) and 535 nm (FAD / scatter) channels.
+
+# %%
+CHANNEL_METRICS = [m for m in ["amp_ratio_median", "tau_mean_median_ps"]
+                   if m in df.columns]
+
+channels = sorted(df["em_filter_nm"].dropna().unique())
+
+if len(channels) < 2:
+    print("Only one emission channel in data -- skipping per-channel comparison.")
+elif not CHANNEL_METRICS:
+    print("No fit metrics available -- run Phase E first.")
+else:
+    for metric in CHANNEL_METRICS:
+        label = METRIC_LABELS.get(metric, metric)
+        n_cols = len(fix_present) * len(channels)
+        fig, axes = plt.subplots(1, n_cols,
+                                 figsize=(3.2 * n_cols, 5),
+                                 squeeze=False)
+        ax_list = axes[0]
+        col_idx = 0
+
+        for fix_type in fix_present:
+            for ch in channels:
+                ax  = ax_list[col_idx]
+                sub = (df[(df["fixation_type"] == fix_type) &
+                          (df["em_filter_nm"]  == ch) &
+                          df["cell_type"].isin(ct_present)]
+                       .dropna(subset=[metric]))
+                cts_here = [ct for ct in ct_present
+                            if (sub["cell_type"] == ct).any()]
+                groups   = [sub[sub["cell_type"] == ct][metric].values
+                            for ct in cts_here]
+                colors   = [ct_color[ct] for ct in cts_here]
+
+                if groups:
+                    parts = ax.violinplot(groups,
+                                          positions=range(len(groups)),
+                                          showmedians=True, showextrema=True)
+                    for pc, c in zip(parts["bodies"], colors):
+                        pc.set_facecolor(c); pc.set_alpha(0.65)
+                    for key2 in ("cmedians", "cbars", "cmins", "cmaxes"):
+                        if key2 in parts:
+                            parts[key2].set_color("k")
+                    rng = np.random.default_rng(seed=col_idx)
+                    for j, (grp, c) in enumerate(zip(groups, colors)):
+                        ax.scatter(j + rng.uniform(-0.07, 0.07, len(grp)),
+                                   grp, s=12, color=c, alpha=0.6, zorder=3)
+                    ax.set_xticks(range(len(cts_here)))
+                    ax.set_xticklabels(cts_here, fontsize=8)
+                else:
+                    ax.set_title("(no data)")
+
+                n_str = "  ".join(f"{ct}:{(sub['cell_type']==ct).sum()}"
+                                  for ct in cts_here)
+                ax.set_title(f"{fix_type}  {int(ch)} nm\nn={n_str}", fontsize=8)
+                ax.set_ylabel(label if col_idx == 0 else "")
+                col_idx += 1
+
+        fig.suptitle(f"{label}  by channel", fontsize=11)
+        plt.tight_layout()
+        _savefig(fig, f"fig_channel_{metric}")
+        plt.show()
+
+# %% [markdown]
+# ## Step 26: Within-image heterogeneity
+#
+# Coefficient of variation (CV = std/mean) of tau_mean and amplitude ratio
+# per image. High CV indicates spatially heterogeneous metabolism within a
+# field of view. Compare BKO vs KPCWT to test whether KO affects metabolic
+# uniformity, not just mean level.
+
+# %%
+CV_METRICS = {
+    "tau_mean_cv":  "tau_mean CV (std/mean)",
+    "amp_ratio_cv": "amplitude ratio CV",
+}
+cv_cols = [c for c in CV_METRICS if c in df.columns]
+
+if not cv_cols:
+    print("CV columns not found -- re-run Phase E Step 18 to compute them.")
+else:
+    for cv_col in cv_cols:
+        label = CV_METRICS[cv_col]
+        fig, axes = plt.subplots(1, len(fix_present),
+                                 figsize=(4 * len(fix_present), 5),
+                                 squeeze=False)
+        for ax, fix_type in zip(axes[0], fix_present):
+            sub = (df[(df["fixation_type"] == fix_type) &
+                      df["cell_type"].isin(ct_present)]
+                   .dropna(subset=[cv_col]))
+            cts_here = [ct for ct in ct_present
+                        if (sub["cell_type"] == ct).any()]
+            groups   = [sub[sub["cell_type"] == ct][cv_col].values
+                        for ct in cts_here]
+            colors   = [ct_color[ct] for ct in cts_here]
+
+            if groups:
+                parts = ax.violinplot(groups,
+                                      positions=range(len(groups)),
+                                      showmedians=True, showextrema=True)
+                for pc, c in zip(parts["bodies"], colors):
+                    pc.set_facecolor(c); pc.set_alpha(0.65)
+                for key2 in ("cmedians", "cbars", "cmins", "cmaxes"):
+                    if key2 in parts:
+                        parts[key2].set_color("k")
+                rng = np.random.default_rng(seed=0)
+                for j, (grp, c) in enumerate(zip(groups, colors)):
+                    ax.scatter(j + rng.uniform(-0.07, 0.07, len(grp)),
+                               grp, s=14, color=c, alpha=0.6, zorder=3)
+                ax.set_xticks(range(len(cts_here)))
+                ax.set_xticklabels(cts_here, fontsize=9)
+
+            n_str = "  ".join(f"{ct}:{(sub['cell_type']==ct).sum()}"
+                              for ct in cts_here)
+            ax.set_title(f"{fix_type}\nn={n_str}", fontsize=8)
+            ax.set_ylabel(label)
+
+        fig.suptitle(label, fontsize=11)
+        plt.tight_layout()
+        _savefig(fig, f"fig_heterogeneity_{cv_col}")
+        plt.show()
+
+# %% [markdown]
+# ## Step 27: Sample size table
+#
+# N images per (fixation_type x cell_type x channel). Used for the methods
+# slide and to flag underpowered groups before interpreting statistics.
+
+# %%
+size_tbl = (df[df["cell_type"].isin(ct_present)]
+            .groupby(["fixation_type", "cell_type", "em_filter_nm"],
+                     dropna=False)
+            .size()
+            .reset_index(name="n_images"))
+
+# Pivot for readability: rows = fixation x channel, cols = cell_type
+if not size_tbl.empty:
+    pivot = size_tbl.pivot_table(
+        index=["fixation_type", "em_filter_nm"],
+        columns="cell_type",
+        values="n_images",
+        aggfunc="sum",
+        fill_value=0,
+    )
+    # Enforce column order
+    col_order = [c for c in CELL_TYPE_ORDER if c in pivot.columns]
+    pivot = pivot[col_order]
+    print("Sample sizes (N images):")
+    print(pivot.to_string())
+
+    # Visual table as a matplotlib figure
+    row_labels = [f"{ft} / {int(ch) if not pd.isna(ch) else 'NA'} nm"
+                  for ft, ch in pivot.index]
+    cell_text  = pivot.values.tolist()
+    col_labels = list(pivot.columns)
+
+    fig, ax = plt.subplots(figsize=(max(4, 1.6 * len(col_labels)),
+                                    max(2, 0.45 * len(row_labels) + 1.2)))
+    ax.axis("off")
+    tbl = ax.table(
+        cellText=cell_text,
+        rowLabels=row_labels,
+        colLabels=col_labels,
+        cellLoc="center",
+        loc="center",
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(11)
+    tbl.scale(1.2, 1.6)
+    ax.set_title("Sample sizes (N images per group)", fontsize=12, pad=10)
+    plt.tight_layout()
+    _savefig(fig, "fig_sample_sizes")
+    plt.show()
+
+    size_tbl.to_csv(results_dir / "sample_sizes.csv", index=False)
+    print(f"Saved: {results_dir / 'sample_sizes.csv'}")
 
 # %% [markdown]
 # ## Summary

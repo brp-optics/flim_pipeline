@@ -118,12 +118,17 @@ from sdtfile import SdtFile
 # -- Configuration ----------------------------------------------------------
 data_dirs = [ '/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260429_KPC_fixed_dishes_on_SLIM', 
               '/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260501_KPC_fixed_dishes_on_SLIM',
-              '/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260509_KPC_fixed_dishes_on_SLIM']
+              '/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260509_KPC_fixed_dishes_on_SLIM',
+              '/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260508_KPC_live_on_SLIM',
+              '/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260517_KPC_live_on_SLIM',
+]
 
 win_data_dirs = [
     Path("E:\\18_RK_Circadian\\data\\raw\\20260429_KPC_fixed_dishes_on_SLIM"),
     Path("E:\\18_RK_Circadian\\data\\raw\\20260501_KPC_fixed_dishes_on_SLIM"),
     Path("E:\\18_RK_Circadian\\data\\raw\\20260509_KPC_fixed_dishes_on_SLIM"),
+    Path("E:\\18_RK_Circadian\\data\\raw\\20260508_KPC_live_on_SLIM"),
+    Path("E:\\18_RK_Circadian\\data\\raw\\20260517_KPC_live_on_SLIM"),
     ]
 
 current_os = "Win" ## Could we automate discovery of this?

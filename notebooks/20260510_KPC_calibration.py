@@ -472,6 +472,60 @@ plt.tight_layout()
 plt.show()
 
 # %% [markdown]
+# ## Step 5b: Chromabead calibration QC -- session summary
+#
+# One point per chroma acquisition, colored by session.
+# Left: raw phasor positions on the universal semicircle.
+# Right: after applying the derived correction -- all points should cluster
+# tightly at the tau_ref position. Spread reveals noise or bead drift.
+
+# %%
+sessions_c = sorted(chroma_cal_df_filt["session_root"].unique())
+colors_c   = plt.cm.tab10(np.linspace(0, 1, max(len(sessions_c), 1)))
+sc_col     = dict(zip(sessions_c, colors_c))
+
+theta_sc = np.linspace(0, np.pi, 300)
+omega_tr = OMEGA * CHROMA_TAU_REF_NS * 1e-9
+G_ref_th = 1.0 / (1.0 + omega_tr ** 2)
+S_ref_th = omega_tr / (1.0 + omega_tr ** 2)
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+for ax, ttl in zip(axes, ["Raw (uncalibrated)",
+                           f"Calibrated (target tau={CHROMA_TAU_REF_NS} ns)"]):
+    ax.plot(0.5 + 0.5 * np.cos(theta_sc), 0.5 * np.sin(theta_sc),
+            "k-", lw=0.8, alpha=0.4)
+    ax.plot(G_ref_th, S_ref_th, "k*", ms=14, zorder=6,
+            label=f"tau_ref={CHROMA_TAU_REF_NS} ns")
+    ax.set_xlabel("G")
+    ax.set_ylabel("S")
+    ax.set_title(ttl)
+    ax.set_aspect("equal", adjustable="datalim")
+
+for sess in sessions_c:
+    sub = chroma_cal_df_filt[chroma_cal_df_filt["session_root"] == sess]
+    col   = sc_col[sess]
+    label = sess.split("_")[0]
+    Gm = sub["G_mean"].values
+    Sm = sub["S_mean"].values
+    ph = sub["phase_corr_rad"].values
+    mo = sub["mod_corr"].values
+    G_c = mo * (Gm * np.cos(ph) - Sm * np.sin(ph))
+    S_c = mo * (Gm * np.sin(ph) + Sm * np.cos(ph))
+    axes[0].scatter(Gm, Sm, color=col, s=60, alpha=0.85,
+                    edgecolors="k", linewidths=0.4, label=label)
+    axes[1].scatter(G_c, S_c, color=col, s=60, alpha=0.85,
+                    edgecolors="k", linewidths=0.4, label=label)
+
+for ax in axes:
+    ax.legend(fontsize=8, framealpha=0.7)
+
+plt.suptitle(
+    "Chromabead calibration QC  |  each point = one acquisition  |  colored by session",
+    fontsize=10)
+plt.tight_layout()
+plt.show()
+
+# %% [markdown]
 # ## Step 6: Assign phasor calibration to each sample
 #
 # For each sample file, find the bracketing chroma calibration measurements
@@ -548,55 +602,48 @@ print(sdt_df[sdt_df["file_type"] == "sample"][
 ].head(10).to_string())
 
 # %% [markdown]
-# ## Step 6b: Urea-based fine-correction
+# ## Step 6b: Urea-based fine-correction (nearest-in-time, per-sample)
 #
 # After chroma calibration, urea (tau ~ 0) should appear at (G=1, S=0).
-# Any residual is a per-session systematic error -- typically a small modulation
-# over/under-correction from the chromabead acquisition conditions varying between
-# sessions.
+# Any residual is drift in the instrument response -- it can vary within a session
+# (as seen in 20260501), so a single session-mean correction is insufficient.
 #
-# For each session we:
-#   1. Apply the session's chroma calibration to all urea files
-#   2. Compute the intensity-weighted mean calibrated phasor (G_urea, S_urea)
-#   3. Derive a secondary correction:
-#        urea_phase_add  = -arctan2(S_urea, G_urea)   [small rotation to zero]
-#        urea_mod_scale  = 1 / |G_urea + i*S_urea|    [rescale to unit circle]
-#   4. Combine with the chroma correction (additions/multiplications in phasor space)
-#      and update phasor_cal_phase_rad / phasor_cal_mod for all sample files in
-#      that session.
+# Two-pass approach:
+#   Pass 1 -- compute the chroma-calibrated phasor for every urea file individually.
+#   Pass 2 -- for each sample file, interpolate between the two temporally bracketing
+#             urea files in the same session (same logic as assign_phasor_cal).
+#             Derive urea_phase_add / urea_mod_scale from that interpolated point
+#             and add it on top of the existing chroma correction.
 #
-# The saved values already include the combined correction -- Phase D consumes them
-# transparently.
+# This removes within-session drift; the saved phasor_cal_* columns already carry the
+# combined (chroma + urea) correction so Phase D consumes them transparently.
 
 # %%
-urea_corr_records = []
+# -- Pass 1: per-urea-file calibrated phasor ----------------------------------
+urea_per_file = []
 
 for session, urea_grp in irf_all.groupby("session_root", sort=True):
-    # Session's chroma cal timepoints
     sess_cal = chroma_cal_df_filt[
         chroma_cal_df_filt["session_root"] == session
     ].sort_values("acquisition_time").reset_index(drop=True)
     if sess_cal.empty:
-        print(f"  {session}: no chroma cal available -- skipping urea correction")
+        print(f"  {session}: no chroma cal -- skipping urea correction")
         continue
-
-    G_list, S_list, w_list = [], [], []
 
     for _, row in urea_grp.iterrows():
         fp = row.get("filepath")
         if pd.isna(fp) or not Path(str(fp)).exists():
             continue
 
-        # Nearest-in-time chroma cal for this urea file (same logic as assign_phasor_cal)
-        t_s = pd.Timestamp(row["acquisition_time"]).to_numpy()
-        before = sess_cal[sess_cal["acquisition_time"] <= pd.Timestamp(t_s)]
-        after  = sess_cal[sess_cal["acquisition_time"] >  pd.Timestamp(t_s)]
+        t_s = pd.Timestamp(row["acquisition_time"])
+        before = sess_cal[sess_cal["acquisition_time"] <= t_s]
+        after  = sess_cal[sess_cal["acquisition_time"] >  t_s]
 
         if not before.empty and not after.empty:
             b, a = before.iloc[-1], after.iloc[0]
             t0 = pd.Timestamp(b["acquisition_time"]).timestamp()
             t1 = pd.Timestamp(a["acquisition_time"]).timestamp()
-            ts = pd.Timestamp(t_s).timestamp()
+            ts = t_s.timestamp()
             wi = np.clip((ts - t0) / (t1 - t0), 0.0, 1.0) if t1 > t0 else 0.0
             phase_c = (1 - wi) * b["phase_corr_rad"] + wi * a["phase_corr_rad"]
             mod_c   = (1 - wi) * b["mod_corr"]       + wi * a["mod_corr"]
@@ -617,63 +664,160 @@ for session, urea_grp in irf_all.groupby("session_root", sort=True):
 
         G_raw, S_raw = phasor_from_decay(data, t_sec, OMEGA)
         G_cal, S_cal = phasor_apply_cal(G_raw, S_raw, phase_c, mod_c)
-
         ph = data.sum(axis=-1)
         ok = np.isfinite(G_cal) & np.isfinite(S_cal) & (ph > 0)
         if not ok.any():
             continue
         w = ph[ok]
-        G_list.append(float(np.average(G_cal[ok], weights=w)))
-        S_list.append(float(np.average(S_cal[ok], weights=w)))
-        w_list.append(float(w.sum()))
+        G_f = float(np.average(G_cal[ok], weights=w))
+        S_f = float(np.average(S_cal[ok], weights=w))
 
-    if not G_list:
-        print(f"  {session}: no usable urea files -- skipping")
+        urea_per_file.append({
+            "session":     session,
+            "filename":    row["filename"],
+            "acq_time":    t_s,
+            "G_cal_file":  G_f,
+            "S_cal_file":  S_f,
+            "n_photons":   float(w.sum()),
+            "dist_from_10": float(np.hypot(G_f - 1.0, S_f)),
+        })
+
+urea_pf_df = pd.DataFrame(urea_per_file)
+if not urea_pf_df.empty:
+    urea_pf_df["acq_time"] = pd.to_datetime(urea_pf_df["acq_time"])
+
+# -- Pass 2: per-sample nearest-in-time urea correction -----------------------
+urea_applied = []
+
+for idx, row in sdt_df.iterrows():
+    if row.get("file_type") != "sample" or pd.isna(row.get("phasor_cal_phase_rad")):
         continue
 
-    # Photon-count weighted mean over all urea files in session
-    w_tot  = sum(w_list)
-    G_urea = sum(g * w for g, w in zip(G_list, w_list)) / w_tot
-    S_urea = sum(s * w for s, w in zip(S_list, w_list)) / w_tot
+    session = row.get("session_root")
+    sess_urea = urea_pf_df[urea_pf_df["session"] == session].sort_values("acq_time")
+    if sess_urea.empty:
+        continue
 
-    urea_phase_add = -float(np.arctan2(S_urea, G_urea))
-    urea_mod_scale = 1.0 / float(np.hypot(G_urea, S_urea))
-    dist           = float(np.hypot(G_urea - 1.0, S_urea))
+    t_s = pd.Timestamp(row["acquisition_time"])
+    before = sess_urea[sess_urea["acq_time"] <= t_s]
+    after  = sess_urea[sess_urea["acq_time"] >  t_s]
 
-    urea_corr_records.append({
+    if not before.empty and not after.empty:
+        b = before.iloc[-1]
+        a = after.iloc[0]
+        t0 = b["acq_time"].timestamp()
+        t1 = a["acq_time"].timestamp()
+        ts = t_s.timestamp()
+        wi = np.clip((ts - t0) / (t1 - t0), 0.0, 1.0) if t1 > t0 else 0.0
+        G_u = (1 - wi) * b["G_cal_file"] + wi * a["G_cal_file"]
+        S_u = (1 - wi) * b["S_cal_file"] + wi * a["S_cal_file"]
+    elif not before.empty:
+        G_u = float(before.iloc[-1]["G_cal_file"])
+        S_u = float(before.iloc[-1]["S_cal_file"])
+    else:
+        G_u = float(after.iloc[0]["G_cal_file"])
+        S_u = float(after.iloc[0]["S_cal_file"])
+
+    urea_phase_add = -float(np.arctan2(S_u, G_u))
+    urea_mod_scale = 1.0 / float(np.hypot(G_u, S_u))
+
+    sdt_df.at[idx, "phasor_cal_phase_rad"] += urea_phase_add
+    sdt_df.at[idx, "phasor_cal_mod"]       *= urea_mod_scale
+
+    urea_applied.append({
+        "filename":       row["filename"],
         "session":        session,
-        "G_urea_cal":     round(G_urea, 5),
-        "S_urea_cal":     round(S_urea, 5),
-        "dist_from_10":   round(dist, 5),
+        "G_urea_interp":  round(G_u, 5),
+        "S_urea_interp":  round(S_u, 5),
+        "dist_from_10":   round(float(np.hypot(G_u - 1.0, S_u)), 5),
         "urea_phase_add": round(urea_phase_add, 6),
         "urea_mod_scale": round(urea_mod_scale, 6),
-        "n_urea_files":   len(G_list),
     })
 
-    print(f"  {session}  G={G_urea:.4f}  S={S_urea:.4f}  dist={dist:.4f}")
-    print(f"    phase_add={np.degrees(urea_phase_add):.3f} deg  "
-          f"mod_scale={urea_mod_scale:.5f}")
-
-urea_corr_df = pd.DataFrame(urea_corr_records)
-print("\nUrea fine-correction per session:")
-print(urea_corr_df.to_string(index=False))
-
-# Apply combined correction: update sample cal values in sdt_df
-for _, corr in urea_corr_df.iterrows():
-    sel = (
-        (sdt_df["file_type"]   == "sample") &
-        (sdt_df["session_root"] == corr["session"]) &
-        sdt_df["phasor_cal_phase_rad"].notna()
-    )
-    sdt_df.loc[sel, "phasor_cal_phase_rad"] += corr["urea_phase_add"]
-    sdt_df.loc[sel, "phasor_cal_mod"]       *= corr["urea_mod_scale"]
-
-n_updated = int(sdt_df["phasor_cal_phase_rad"].notna().sum())
-print(f"\nUpdated phasor_cal_phase_rad / phasor_cal_mod for {n_updated} sample files.")
+urea_applied_df = pd.DataFrame(urea_applied)
+print(f"\nApplied nearest-in-time urea correction to {len(urea_applied_df)} sample files.")
 print("Combined (chroma + urea) correction stored -- Phase D reads these directly.")
 
-# Save urea correction table for reference
-urea_corr_df.to_csv(results_dir / "urea_cal_correction.csv", index=False)
+if not urea_applied_df.empty:
+    summary = urea_applied_df.groupby("session")["dist_from_10"].agg(
+        n="count", mean="mean", std="std", min="min", max="max"
+    ).round(5)
+    print("\nInterpolated urea dist_from_10 applied per session (pre-correction residual):")
+    print(summary.to_string())
+
+# Save per-sample applied correction for inspection
+urea_applied_df.to_csv(results_dir / "urea_cal_correction.csv", index=False)
+
+# %% [markdown]
+# ## Step 6c: Urea calibration check
+#
+# Plots the chroma-calibrated phasor of every urea file (before the urea correction
+# is applied).  Target is (G=1, S=0).  Points far from (1,0) indicate within-session
+# drift that the nearest-in-time correction will handle for sample files.
+
+# %%
+sessions_u = sorted(urea_pf_df["session"].unique()) if not urea_pf_df.empty else []
+colors_u   = plt.cm.tab10(np.linspace(0, 1, max(len(sessions_u), 1)))
+sess_color = dict(zip(sessions_u, colors_u))
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+# -- Left: phasor scatter near (1, 0) ----------------------------------------
+ax = axes[0]
+theta = np.linspace(0, np.pi, 300)
+ax.plot(0.5 + 0.5 * np.cos(theta), 0.5 * np.sin(theta),
+        "k-", lw=0.8, alpha=0.4, label="universal semicircle")
+ax.axhline(0, color="k", lw=0.4, alpha=0.3)
+ax.axvline(1, color="k", lw=0.4, alpha=0.3)
+ax.plot(1.0, 0.0, "k+", ms=12, mew=1.5, label="target (1, 0)")
+
+for sess in sessions_u:
+    sub = urea_pf_df[urea_pf_df["session"] == sess]
+    label = sess.split("_")[0]
+    ax.scatter(sub["G_cal_file"], sub["S_cal_file"],
+               color=sess_color[sess], s=40, alpha=0.8,
+               edgecolors="k", linewidths=0.4, label=label)
+    ax.scatter(sub["G_cal_file"].mean(), sub["S_cal_file"].mean(),
+               color=sess_color[sess], s=120, marker="D",
+               edgecolors="k", linewidths=0.8)
+
+ax.set_xlim(0.90, 1.10)
+ax.set_ylim(-0.06, 0.10)
+ax.set_xlabel("G (chroma-calibrated)")
+ax.set_ylabel("S (chroma-calibrated)")
+ax.set_title("Urea phasor per file (chroma-only cal)\ncircles=individual, diamonds=session mean")
+ax.legend(fontsize=8, framealpha=0.7)
+
+# -- Right: dist_from_10 vs acquisition time ----------------------------------
+ax2 = axes[1]
+for sess in sessions_u:
+    sub = urea_pf_df[urea_pf_df["session"] == sess].sort_values("acq_time")
+    label = sess.split("_")[0]
+    ax2.plot(sub["acq_time"], sub["dist_from_10"],
+             "o-", color=sess_color[sess], ms=6, label=label)
+
+ax2.axhline(0.01, color="k", ls="--", lw=0.8, alpha=0.6, label="dist=0.01 threshold")
+ax2.set_ylabel("dist from (1, 0)")
+ax2.set_xlabel("acquisition time")
+ax2.set_title("Within-session urea drift")
+ax2.legend(fontsize=8)
+fig.autofmt_xdate()
+plt.tight_layout()
+plt.show()
+
+# -- Per-session table --------------------------------------------------------
+if not urea_pf_df.empty:
+    tbl = urea_pf_df.groupby("session").agg(
+        n_files=("filename", "count"),
+        G_mean=("G_cal_file", "mean"),
+        G_std =("G_cal_file", "std"),
+        S_mean=("S_cal_file", "mean"),
+        S_std =("S_cal_file", "std"),
+        dist_mean=("dist_from_10", "mean"),
+        dist_max =("dist_from_10", "max"),
+    ).round(5)
+    print("Per-session urea summary (chroma-only cal):")
+    print(tbl.to_string())
 
 # %%
 # Save updated metadata

@@ -30,17 +30,30 @@ from sdtfile import SdtFile
 WIN_DATA_DIRS = [
     Path(r"E:\18_RK_Circadian\data\raw\20260429_KPC_fixed_dishes_on_SLIM"),
     Path(r"E:\18_RK_Circadian\data\raw\20260501_KPC_fixed_dishes_on_SLIM"),
+    Path(r"E:\18_RK_Circadian\data\raw\20260509_KPC_fixed_dishes_on_SLIM"),
+    Path(r"E:\18_RK_Circadian\data\raw\20260508_KPC_live_on_SLIM"),
+    Path(r"E:\18_RK_Circadian\data\raw\20260517_KPC_live_on_SLIM"),
 ]
 LIN_DATA_DIRS = [
     Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260429_KPC_fixed_dishes_on_SLIM"),
     Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260501_KPC_fixed_dishes_on_SLIM"),
+    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260509_KPC_fixed_dishes_on_SLIM"),
+    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260508_KPC_live_on_SLIM"),
+    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260517_KPC_live_on_SLIM"),
 ]
 CURRENT_OS = "Win"
 data_dirs = WIN_DATA_DIRS if CURRENT_OS == "Win" else LIN_DATA_DIRS
 
-# Minimum photon count after box-kernel smoothing.
-# The kernel size is (2*b+1) x (2*b+1), where b comes from the fit folder name.
-MIN_PHOTONS_SMOOTHED = 50
+# Minimum total photon count in the SPCImage-binned region (sum over the
+# (2b+1)^2 neighbourhood), per number of fit components.
+# More components require more photons for reliable parameter separation.
+# None is the fallback when n_components is not parseable from the folder name.
+MIN_PHOTONS_BY_NCOMP = {
+    1:    1_000,
+    2:    5_000,
+    3:   20_000,
+    None: 5_000,
+}
 
 # Chi^2 acceptance window
 CHI2_LO = 0.8
@@ -75,6 +88,18 @@ TAUMEAN_CFG = {
     "glu":  (("a2", "tau2"), ("a3", "tau3")),
     "form": (("a1", "tau1"), ("a2", "tau2")),
     "live": (("a1", "tau1"), ("a2", "tau2")),
+}
+
+# Per-pixel amplitude-weighted tau_mean bounds (ps).
+# Pixels outside this range are excluded even if all other criteria pass.
+# Use (lo, None) or (None, hi) to set only one side.
+# Primary use: remove punctate low-tau artifacts in live images (lipid droplets,
+# collapsed fits) without tightening individual component bounds.
+# Set the value to None to skip tau_mean filtering for that fixation type.
+TAU_MEAN_BOUNDS = {
+    "glu":  None,
+    "form": None,
+    "live": (400.0, None),
 }
 
 # Amplitude ratio (numerator component, denominator component)
@@ -279,6 +304,7 @@ def compute_fit_mask(
     fixation_type: str,
     b_val: int,
     sdt_photons: np.ndarray | None = None,
+    n_components: int | None = None,
 ) -> tuple:
     """Combine four quality criteria into a single boolean mask.
 
@@ -299,11 +325,16 @@ def compute_fit_mask(
 
     n_total = shape[0] * shape[1]
 
-    # 1. Photon count with box kernel
+    # 1. Photon count -- SPCImage sums the (2b+1)^2 neighbourhood before fitting
+    # but exports original per-pixel intensities in _photons.asc.
+    # Multiply the local average by the kernel area to recover the binned total,
+    # then compare against the per-component threshold.
+    min_ph     = MIN_PHOTONS_BY_NCOMP.get(n_components, MIN_PHOTONS_BY_NCOMP[None])
     photon_src = fd.get("photons") if "photons" in fd else sdt_photons
     if photon_src is not None and photon_src.shape == shape:
+        kernel_area = (2 * b_val + 1) ** 2
         smoothed    = uniform_filter(photon_src.astype(float), size=2 * b_val + 1)
-        mask_photon = smoothed >= MIN_PHOTONS_SMOOTHED
+        mask_photon = smoothed * kernel_area >= min_ph
     else:
         mask_photon = np.ones(shape, dtype=bool)    # no photon data -- pass all
 
@@ -332,16 +363,33 @@ def compute_fit_mask(
             arr = fd[param]
             mask_tau &= np.isfinite(arr) & (arr >= lo) & (arr <= hi)
 
-    mask_final = mask_photon & mask_chi2 & mask_amp & mask_tau
+    # 5. Amplitude-weighted tau_mean bounds (catches punctate low/high-tau artifacts)
+    taumean_cfg = TAU_MEAN_BOUNDS.get(fixation_type)
+    if taumean_cfg is not None:
+        tau_m = compute_tau_mean(fd, fixation_type)
+        if tau_m is not None and tau_m.shape == shape:
+            lo_tm, hi_tm = taumean_cfg
+            mask_taumean = np.isfinite(tau_m)
+            if lo_tm is not None:
+                mask_taumean &= tau_m >= lo_tm
+            if hi_tm is not None:
+                mask_taumean &= tau_m <= hi_tm
+        else:
+            mask_taumean = np.ones(shape, dtype=bool)
+    else:
+        mask_taumean = np.ones(shape, dtype=bool)
+
+    mask_final = mask_photon & mask_chi2 & mask_amp & mask_tau & mask_taumean
 
     breakdown = {
-        "n_total":     n_total,
-        "n_photon_ok": int(mask_photon.sum()),
-        "n_chi2_ok":   int(mask_chi2.sum()),
-        "n_amp_ok":    int(mask_amp.sum()),
-        "n_tau_ok":    int(mask_tau.sum()),
-        "n_final":     int(mask_final.sum()),
-        "pct_final":   round(100.0 * mask_final.sum() / n_total, 1),
+        "n_total":       n_total,
+        "n_photon_ok":   int(mask_photon.sum()),
+        "n_chi2_ok":     int(mask_chi2.sum()),
+        "n_amp_ok":      int(mask_amp.sum()),
+        "n_tau_ok":      int(mask_tau.sum()),
+        "n_taumean_ok":  int(mask_taumean.sum()),
+        "n_final":       int(mask_final.sum()),
+        "pct_final":     round(100.0 * mask_final.sum() / n_total, 1),
     }
     return mask_final, breakdown
 
@@ -379,10 +427,22 @@ def compute_tau_mean(fd: dict, fixation_type: str) -> np.ndarray | None:
 # each export folder contains its own mask for the specific fit configuration.
 
 # %%
+# Set True to ignore the cache and reprocess every fit set from scratch.
+# Needed when TAU_BOUNDS, CHI2_LO/HI, or MIN_PHOTONS_BY_NCOMP change.
+FORCE_RECOMPUTE = False
+
 sample_filenames = set(sdt_df.loc[sdt_df["file_type"] == "sample", "filename"])
 sample_key_rows  = fit_map_df[fit_map_df["sdt_filename"].isin(sample_filenames)]
 sample_keys      = sorted(set(sample_key_rows["fit_set_key"]))
 print(f"Unique fit sets to process: {len(sample_keys)}")
+
+# Load existing summary as cache
+_summary_path = results_dir / "fit_mask_summary.csv"
+if not FORCE_RECOMPUTE and _summary_path.exists():
+    _cache_df = pd.read_csv(_summary_path).set_index("fit_set_key")
+    print(f"  Cache: {len(_cache_df)} existing entries in fit_mask_summary.csv")
+else:
+    _cache_df = pd.DataFrame()
 
 # Build fast lookups
 fn_to_meta = sdt_df.set_index("filename")[["filepath", "fixation_type"]].to_dict("index")
@@ -391,13 +451,26 @@ key_to_fn  = (
 )
 
 mask_summary_rows = []
+n_cached = 0
+n_computed = 0
 
-for i, fit_set_key in enumerate(sample_keys):
+for fit_set_key in sample_keys:
     fit_dir, session_root, rel_dir, base_stem = fit_dir_from_key(fit_set_key)
     if fit_dir is None or not fit_dir.exists():
-        print(f"  [SKIP] fit dir not found for: {fit_set_key[:60]}")
+        print(f"  [SKIP] fit dir not found: {fit_set_key[:60]}")
         continue
 
+    mask_npy = fit_dir / f"{base_stem}_fit_mask.npy"
+
+    # Cache hit: .npy on disk and summary row present
+    if (not FORCE_RECOMPUTE
+            and mask_npy.exists()
+            and fit_set_key in _cache_df.index):
+        mask_summary_rows.append(_cache_df.loc[fit_set_key].to_dict())
+        n_cached += 1
+        continue
+
+    # Cache miss: load .asc files and recompute
     folder_meta   = parse_fit_folder(Path(rel_dir).name)
     b_val         = folder_meta["b_val"]
     shift_free    = folder_meta["shift_free"]
@@ -411,7 +484,6 @@ for i, fit_set_key in enumerate(sample_keys):
         print(f"  [SKIP] no .asc files loaded: {base_stem}")
         continue
 
-    # Photon fallback from raw SDT if SPCImage did not export photon count
     sdt_photons = None
     if "photons" not in fd and sdt_path:
         try:
@@ -420,8 +492,9 @@ for i, fit_set_key in enumerate(sample_keys):
         except Exception:
             pass
 
-    mask, breakdown = compute_fit_mask(fd, fixation_type, b_val, sdt_photons)
-    np.save(str(fit_dir / f"{base_stem}_fit_mask.npy"), mask)
+    mask, breakdown = compute_fit_mask(fd, fixation_type, b_val, sdt_photons,
+                                       n_components=folder_meta.get("n_components"))
+    np.save(str(mask_npy), mask)
 
     mask_summary_rows.append({
         "fit_set_key":   fit_set_key,
@@ -434,13 +507,22 @@ for i, fit_set_key in enumerate(sample_keys):
         "fixation_type": fixation_type,
         **breakdown,
     })
+    n_computed += 1
 
-    if (i + 1) % 20 == 0 or (i + 1) == len(sample_keys):
-        print(f"  {i+1}/{len(sample_keys)}  {base_stem[:40]}  "
-              f"kept={breakdown.get('pct_final', '?')}%")
+    if n_computed % 20 == 0:
+        n_tot = breakdown.get("n_total", 1) or 1
+        def _pct(k): return round(100.0 * breakdown.get(k, 0) / n_tot)
+        print(f"  computed {n_computed}  {base_stem[:32]}"
+              f"  ph={_pct('n_photon_ok')}%"
+              f"  chi2={_pct('n_chi2_ok')}%"
+              f"  amp={_pct('n_amp_ok')}%"
+              f"  tau={_pct('n_tau_ok')}%"
+              f"  taum={_pct('n_taumean_ok')}%"
+              f"  kept={breakdown.get('pct_final', '?')}%")
 
 mask_summary_df = pd.DataFrame(mask_summary_rows)
-print(f"\nProcessed {len(mask_summary_df)} fit sets")
+print(f"\nDone: {len(mask_summary_df)} fit sets  "
+      f"({n_cached} cached, {n_computed} newly computed)")
 
 # Write fit_quality_summary.csv in each fit folder
 for (session_root, fit_folder), grp in mask_summary_df.groupby(
@@ -465,6 +547,124 @@ if not mask_summary_df.empty and "pct_final" in mask_summary_df.columns:
     print("\nPer-criterion counts (mean over files):")
     crit_cols = ["n_photon_ok", "n_chi2_ok", "n_amp_ok", "n_tau_ok", "n_final"]
     print(mask_summary_df.groupby("fixation_type")[crit_cols].mean().round(0).to_string())
+
+# %% [markdown]
+# ## Step 15b: Mask failure diagnosis
+#
+# Identifies which criterion is responsible for low pixel retention, and samples
+# one failing fit set to show actual parameter value ranges.
+
+# %%
+if mask_summary_df.empty:
+    print("mask_summary_df is empty -- run Step 15 first.")
+else:
+    bad = mask_summary_df[mask_summary_df["pct_final"] < 5.0].copy()
+    print(f"Fit sets with <5% pixels kept: {len(bad)} / {len(mask_summary_df)}")
+
+    if not bad.empty:
+        n_tot_col = bad["n_total"].clip(lower=1)
+        for col, label in [
+            ("n_photon_ok", "photon"),
+            ("n_chi2_ok",   "chi2"),
+            ("n_amp_ok",    "amplitude"),
+            ("n_tau_ok",    "tau"),
+        ]:
+            pct = (bad[col] / n_tot_col * 100).round(1)
+            print(f"  {label:12s}  median pass rate in failing set: {pct.median():.1f}%"
+                  f"  (min {pct.min():.1f}%)")
+
+        # Sample one failing fit set and show raw parameter ranges
+        sample_key = bad.sort_values("pct_final").iloc[0]["fit_set_key"]
+        fix_type   = bad.sort_values("pct_final").iloc[0].get("fixation_type", "?")
+        fit_dir, _, _, base_stem = fit_dir_from_key(sample_key)
+        print(f"\nSampling worst case: {base_stem}  fixation={fix_type}")
+
+        if fit_dir and fit_dir.exists():
+            fd_sample = load_asc_fit_set(fit_dir, base_stem)
+            print(f"  Parameters loaded: {list(fd_sample.keys())}")
+            for param, arr in sorted(fd_sample.items()):
+                finite = arr[np.isfinite(arr)]
+                if finite.size == 0:
+                    print(f"    {param:12s}  all NaN/inf")
+                    continue
+                print(f"    {param:12s}  min={finite.min():.4g}"
+                      f"  median={float(np.median(finite)):.4g}"
+                      f"  max={finite.max():.4g}")
+            print(f"\n  TAU_BOUNDS for '{fix_type}': {TAU_BOUNDS.get(fix_type, 'not defined')}")
+            print(f"  CHI2 window: [{CHI2_LO}, {CHI2_HI}]")
+            print(f"  MIN_PHOTONS_SMOOTHED: {MIN_PHOTONS_SMOOTHED}")
+        else:
+            print(f"  Fit dir not accessible: {fit_dir}")
+
+# %% [markdown]
+# ## Step 15c: Chi^2 distribution figure
+#
+# Samples N_CHI2_SAMPLE files per fixation type; pools chi^2 values from
+# quality-masked pixels and plots histograms with the acceptance window overlaid.
+# A good fit should peak near 1.0; heavy tails suggest model mismatch or
+# undercounting photons.
+
+# %%
+N_CHI2_SAMPLE = 8
+
+chi2_pools = {}
+
+for fix_type in sorted(sample_df["fixation_type"].dropna().unique()):
+    sub      = sample_df[sample_df["fixation_type"] == fix_type]
+    sampled  = sub.sample(n=min(N_CHI2_SAMPLE, len(sub)), random_state=0)
+    arrs     = []
+    for _, row in sampled.iterrows():
+        key = best_fit_key(row["filename"], fix_type)
+        if key is None:
+            continue
+        fit_dir, _, rel_dir, base_stem = fit_dir_from_key(key)
+        if fit_dir is None:
+            continue
+        fd = load_asc_fit_set(fit_dir, base_stem)
+        if not fd or "chi2" not in fd:
+            continue
+        mask = load_saved_mask(key)
+        if mask is None:
+            fm = parse_fit_folder(Path(rel_dir).name)
+            mask, _ = compute_fit_mask(fd, fix_type, fm["b_val"])
+        chi2_arr = fd["chi2"]
+        if chi2_arr.shape == mask.shape:
+            vals = chi2_arr[mask & np.isfinite(chi2_arr)]
+            if vals.size > 0:
+                arrs.append(vals)
+    if arrs:
+        chi2_pools[fix_type] = np.concatenate(arrs)
+        print(f"  {fix_type}: {len(arrs)} files, {chi2_pools[fix_type].size:,} pixels")
+
+if chi2_pools:
+    n_ft = len(chi2_pools)
+    palette_ft = plt.cm.Set2(np.linspace(0, 0.8, n_ft))
+    fig, axes  = plt.subplots(1, n_ft, figsize=(5 * n_ft, 4), squeeze=False)
+
+    for ax, (fix_type, vals), col in zip(axes[0], chi2_pools.items(), palette_ft):
+        lo_p = max(0.0, float(np.percentile(vals, 0.5)))
+        hi_p = min(5.0, float(np.percentile(vals, 99.5)))
+        ax.hist(vals, bins=120, range=(lo_p, hi_p), density=True,
+                color=col, alpha=0.75, label=fix_type)
+        ax.axvspan(CHI2_LO, CHI2_HI, color="green", alpha=0.12,
+                   label=f"window [{CHI2_LO}, {CHI2_HI}]")
+        ax.axvline(CHI2_LO, color="green", lw=1.2, ls="--")
+        ax.axvline(CHI2_HI, color="green", lw=1.2, ls="--")
+        ax.axvline(1.0, color="k", lw=0.8, ls=":", alpha=0.7, label="ideal (1.0)")
+        pct_in = float(100 * ((vals >= CHI2_LO) & (vals <= CHI2_HI)).mean())
+        ax.set_xlabel("chi^2")
+        ax.set_ylabel("density")
+        ax.set_title(f"{fix_type}\n"
+                     f"median={float(np.median(vals)):.2f}  "
+                     f"in window: {pct_in:.1f}%", fontsize=9)
+        ax.legend(fontsize=8)
+
+    plt.suptitle(
+        f"Chi^2 distributions (quality-masked pixels, "
+        f"up to {N_CHI2_SAMPLE} files per fixation type)",
+        fontsize=10)
+    plt.tight_layout()
+    plt.show()
 
 # %% [markdown]
 # ## Step 16: Amplitude-weighted tau_mean maps
@@ -582,9 +782,8 @@ for _, row in sample_df.iterrows():
     if fixation_type in RATIO_CFG:
         num_p, den_p = RATIO_CFG[fixation_type]
         if num_p in fd and den_p in fd:
-            denom = fd[num_p] + fd[den_p]
             with np.errstate(invalid="ignore", divide="ignore"):
-                ratio = np.where(denom > 0, fd[num_p] / denom, np.nan)
+                ratio = np.where(fd[den_p] > 0, fd[num_p] / fd[den_p], np.nan)
             vals = ratio[mask & np.isfinite(ratio)]
             if vals.size > 0:
                 ratio_pools[fixation_type].append(vals)
@@ -622,7 +821,7 @@ for ft in fix_types:
         vals = np.concatenate(ratio_pools[ft])
         axes[0][col].hist(vals, bins=80, range=(0.0, 1.0), density=True,
                           color="darkorange", alpha=0.8)
-        axes[0][col].set_xlabel(f"{num_p}/({num_p}+{den_p})")
+        axes[0][col].set_xlabel(f"{num_p}/{den_p}")
         axes[0][col].set_ylabel("density")
         axes[0][col].set_title(
             f"{ft}  amplitude ratio\n"
@@ -678,25 +877,30 @@ for _, row in sample_df.iterrows():
     tau_m = compute_tau_mean(fd, fixation_type)
     if tau_m is not None:
         vals = tau_m[mask & np.isfinite(tau_m)]
+        mn   = float(vals.mean())     if vals.size > 0 else np.nan
+        sd   = float(vals.std())      if vals.size > 0 else np.nan
         rec["tau_mean_median_ps"] = float(np.median(vals)) if vals.size > 0 else np.nan
-        rec["tau_mean_mean_ps"]   = float(vals.mean())     if vals.size > 0 else np.nan
-        rec["tau_mean_std_ps"]    = float(vals.std())      if vals.size > 0 else np.nan
+        rec["tau_mean_mean_ps"]   = mn
+        rec["tau_mean_std_ps"]    = sd
+        rec["tau_mean_cv"]        = sd / mn if (mn and mn > 0) else np.nan
     else:
         rec.update(tau_mean_median_ps=np.nan, tau_mean_mean_ps=np.nan,
-                   tau_mean_std_ps=np.nan)
+                   tau_mean_std_ps=np.nan, tau_mean_cv=np.nan)
 
     num_p, den_p = RATIO_CFG.get(fixation_type, (None, None))
     if num_p and den_p and num_p in fd and den_p in fd:
-        denom = fd[num_p] + fd[den_p]
         with np.errstate(invalid="ignore", divide="ignore"):
-            ratio = np.where(denom > 0, fd[num_p] / denom, np.nan)
+            ratio = np.where(fd[den_p] > 0, fd[num_p] / fd[den_p], np.nan)
         vals = ratio[mask & np.isfinite(ratio)]
+        mn   = float(vals.mean())     if vals.size > 0 else np.nan
+        sd   = float(vals.std())      if vals.size > 0 else np.nan
         rec["amp_ratio_median"] = float(np.median(vals)) if vals.size > 0 else np.nan
-        rec["amp_ratio_mean"]   = float(vals.mean())     if vals.size > 0 else np.nan
-        rec["amp_ratio_std"]    = float(vals.std())      if vals.size > 0 else np.nan
+        rec["amp_ratio_mean"]   = mn
+        rec["amp_ratio_std"]    = sd
+        rec["amp_ratio_cv"]     = sd / mn if (mn and mn > 0) else np.nan
     else:
         rec.update(amp_ratio_median=np.nan, amp_ratio_mean=np.nan,
-                   amp_ratio_std=np.nan)
+                   amp_ratio_std=np.nan, amp_ratio_cv=np.nan)
 
     fit_records.append(rec)
 

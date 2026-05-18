@@ -20,10 +20,16 @@ from sdtfile import SdtFile
 WIN_DATA_DIRS = [
     Path(r"E:\18_RK_Circadian\data\raw\20260429_KPC_fixed_dishes_on_SLIM"),
     Path(r"E:\18_RK_Circadian\data\raw\20260501_KPC_fixed_dishes_on_SLIM"),
+    Path(r"E:\18_RK_Circadian\data\raw\20260509_KPC_fixed_dishes_on_SLIM"),
+    Path(r"E:\18_RK_Circadian\data\raw\20260508_KPC_live_on_SLIM"),
+    Path(r"E:\18_RK_Circadian\data\raw\20260517_KPC_live_on_SLIM"),
 ]
 LIN_DATA_DIRS = [
     Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260429_KPC_fixed_dishes_on_SLIM"),
     Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260501_KPC_fixed_dishes_on_SLIM"),
+    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260509_KPC_fixed_dishes_on_SLIM"),
+    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260508_KPC_live_on_SLIM"),
+    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260517_KPC_live_on_SLIM"),
 ]
 CURRENT_OS = "Win"
 data_dirs = WIN_DATA_DIRS if CURRENT_OS == "Win" else LIN_DATA_DIRS
@@ -48,7 +54,7 @@ PHASOR_EM_FILTERS = [457, 535]
 
 # Column order for cell_type in plots (left to right).
 # Any cell types not listed here are appended in sorted order after.
-CELL_TYPE_ORDER = ["WT", "BKO"]
+CELL_TYPE_ORDER = ["KPCWT", "BKO"]
 
 # Annotation groups to merge before plotting (rhs label is what appears in plots)
 ANNOTATION_REMAP = {
@@ -419,146 +425,6 @@ for _, row in sample_df.sort_values("acquisition_time").iterrows():
               f"   n_px={valid.sum()}")
 
 # %% [markdown]
-# ## Step 11b: Urea (IRF) calibration check
-#
-# Urea crystals are pure scatter -- their effective lifetime is ~0 ns.
-# In calibrated phasor space a tau=0 source must land at (G=1, S=0),
-# the right endpoint of the universal semicircle.
-#
-# If the cluster of urea phasors is visibly rotated away from (1, 0)
-# after applying the chromabead calibration, the reference lifetime
-# CHROMA_TAU_REF_NS in Phase B is wrong and needs re-fitting.
-#
-# Note: phasor analysis assumes the laser pulse is at t=0 of the time axis.
-# Any fixed time-offset appears as a phase rotation in the raw phasor; the
-# chromabead calibration is supposed to correct for it. A urea cloud sitting
-# away from (1, 0) means that correction is incomplete.
-
-# %%
-irf_df = sdt_df[sdt_df["file_type"] == "irf"].copy()
-print(f"IRF (urea) files found: {len(irf_df)}")
-
-if irf_df.empty:
-    print("No IRF files -- skipping calibration check.")
-else:
-    # Calibration lookup: for each urea file, find the sample file in the same
-    # session with the nearest acquisition_time and use its cal values.
-    # This approximates "calibrated by the adjacent chroma" without re-reading
-    # the raw chromabead phasors from Phase B.
-    cal_pool = (
-        sample_df[["session_root", "acquisition_time",
-                   "phasor_cal_phase_rad", "phasor_cal_mod"]]
-        .dropna(subset=["phasor_cal_phase_rad", "phasor_cal_mod"])
-        .sort_values("acquisition_time")
-        .copy()
-    )
-    cal_pool["acquisition_time"] = pd.to_datetime(cal_pool["acquisition_time"])
-
-    def _nearest_cal(session, acq_time):
-        pool = cal_pool[cal_pool["session_root"] == session]
-        if pool.empty:
-            return None, None
-        dt = (pool["acquisition_time"] - pd.to_datetime(acq_time)).abs()
-        best = pool.iloc[dt.argmin()]
-        return float(best["phasor_cal_phase_rad"]), float(best["phasor_cal_mod"])
-
-    # Compute per-file mean phasor (intensity-weighted over all pixels)
-    records = []
-    for _, row in irf_df.iterrows():
-        fp = row.get("filepath")
-        if pd.isna(fp) or not Path(str(fp)).exists():
-            continue
-        session  = row.get("session_root", "")
-        acq_time = row.get("acquisition_time")
-        phase_corr, mod_corr = _nearest_cal(session, acq_time)
-        if phase_corr is None:
-            continue
-        try:
-            sdt_obj   = SdtFile(str(fp))
-            decay_raw = sdt_obj.data[0].astype(float)
-        except Exception as exc:
-            print(f"  Load failed: {row['filename']}: {exc}")
-            continue
-
-        time_ns          = _get_time_ns(sdt_obj, decay_raw.shape[2])
-        G_raw, S_raw, ph = compute_phasor_raw(decay_raw, time_ns)
-        G_cal, S_cal     = apply_phasor_cal(G_raw, S_raw, phase_corr, mod_corr)
-
-        ok = np.isfinite(G_cal) & np.isfinite(S_cal) & (ph > 0)
-        if not ok.any():
-            continue
-        w = ph[ok]
-        wtot = float(w.sum())
-        records.append({
-            "filename":    row["filename"],
-            "session":     session,
-            "acq_time":    acq_time,
-            "phase_corr":  phase_corr,
-            "mod_corr":    mod_corr,
-            "G_raw_wmean": float(np.average(G_raw[ok], weights=w)),
-            "S_raw_wmean": float(np.average(S_raw[ok], weights=w)),
-            "G_cal_wmean": float(np.average(G_cal[ok], weights=w)),
-            "S_cal_wmean": float(np.average(S_cal[ok], weights=w)),
-        })
-
-    if not records:
-        print("No urea files could be loaded/calibrated.")
-    else:
-        urea_df = pd.DataFrame(records)
-        urea_df["dist_from_10"] = np.sqrt(
-            (urea_df["G_cal_wmean"] - 1.0) ** 2 + urea_df["S_cal_wmean"] ** 2
-        )
-
-        # Per-session summary table
-        print("\nPer-session urea calibration check (should be near G=1, S=0):")
-        tbl = urea_df.groupby("session")[
-            ["G_raw_wmean", "S_raw_wmean", "G_cal_wmean", "S_cal_wmean", "dist_from_10"]
-        ].agg(["mean", "std"]).round(4)
-        print(tbl.to_string())
-
-        print(f"\nAll-session mean calibrated urea: "
-              f"G={urea_df['G_cal_wmean'].mean():.4f}  "
-              f"S={urea_df['S_cal_wmean'].mean():.4f}  "
-              f"dist={urea_df['dist_from_10'].mean():.4f}")
-
-        # Scatter plot: one point per urea file
-        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-        for ax in axes:
-            draw_semicircle(ax)
-            ax.axvline(1.0, color="lime", lw=0.8, alpha=0.4)
-            ax.axhline(0.0, color="lime", lw=0.8, alpha=0.4)
-            ax.plot(1.0, 0.0, "g*", ms=14, label="expected (1, 0)", zorder=5)
-            ax.set_xlim(-0.05, 1.15)
-            ax.set_ylim(-0.1, 0.6)
-            ax.set_aspect("equal")
-
-        sessions = sorted(urea_df["session"].unique())
-        colors   = plt.cm.tab10.colors
-        for ax, xcol, ycol, title in zip(
-            axes,
-            ["G_raw_wmean", "G_cal_wmean"],
-            ["S_raw_wmean", "S_cal_wmean"],
-            ["raw (uncalibrated)", "calibrated -- should be at (1, 0)"],
-        ):
-            for i, sess in enumerate(sessions):
-                sub = urea_df[urea_df["session"] == sess]
-                ax.scatter(sub[xcol], sub[ycol],
-                           color=colors[i % len(colors)],
-                           s=60, zorder=4, label=sess)
-            ax.legend(fontsize=7, loc="upper left")
-            ax.set_xlabel("G")
-            ax.set_ylabel("S")
-            ax.set_title(f"Urea per-file mean -- {title}", fontsize=9)
-
-        plt.suptitle(
-            "Urea (IRF) calibration check  |  each point = one urea file  |  "
-            "calibrated target = (1, 0)",
-            fontsize=10,
-        )
-        plt.tight_layout()
-        plt.show()
-
-# %% [markdown]
 # ## Step 12: Per-file phasor summary
 #
 # Process every sample file. Results are cached in `phasor_cache` (dict keyed
@@ -778,6 +644,103 @@ for (fix_type, em_nm), grp in plot_df.groupby(
         f"Per-file mean phasor  {fix_type} / {em_nm} nm  "
         f"(n={len(ps_grp)} files)",
         fontsize=9,
+    )
+    plt.tight_layout()
+    plt.show()
+
+# %% [markdown]
+# ## Step 13b: Per-file phasor drill-down
+#
+# Plots one hexbin panel per file for a configurable (annotation, fixation, channel,
+# cell_types) slice.  Useful for checking whether a group-level pattern is driven
+# by one or two outlier files.  The white cross marks the intensity-weighted mean
+# for that file.
+
+# %%
+# -- Filter configuration -- adjust as needed ---------------------------------
+DRILL_ANNOTATION = "colony_deep"   # raw annotation value (pre-remap)
+DRILL_FIXATION   = "form"
+DRILL_EM_NM      = 457
+DRILL_CELL_TYPES = None            # None = all; or e.g. ["BKO", "KPCWT"]
+
+# Resolve through ANNOTATION_REMAP so the label matches stored values
+_drill_annot = ANNOTATION_REMAP.get(DRILL_ANNOTATION, DRILL_ANNOTATION)
+
+drill_df = sample_df.copy()
+drill_df["_annot_mapped"] = drill_df["position_annotation"].map(
+    lambda a: ANNOTATION_REMAP.get(str(a), str(a))
+)
+drill_df = drill_df[
+    (drill_df["_annot_mapped"] == _drill_annot) &
+    (drill_df["fixation_type"] == DRILL_FIXATION) &
+    (drill_df["em_filter_nm"]  == DRILL_EM_NM) &
+    drill_df["filename"].isin(phasor_cache)
+]
+if DRILL_CELL_TYPES is not None:
+    drill_df = drill_df[drill_df["cell_type"].isin(DRILL_CELL_TYPES)]
+drill_df = drill_df.sort_values(["cell_type", "acquisition_time"]).reset_index(drop=True)
+
+print(f"Files matching filter ({_drill_annot} / {DRILL_FIXATION} / {DRILL_EM_NM} nm):"
+      f"  {len(drill_df)}")
+if drill_df.empty:
+    print("  No files -- check DRILL_ANNOTATION / DRILL_FIXATION / DRILL_EM_NM.")
+else:
+    print(drill_df[["filename", "cell_type", "session_root"]].to_string(index=False))
+
+    # Per-file means for the cross marker
+    means_idx = plot_phasor_df.set_index("filename") if "filename" in plot_phasor_df.columns \
+        else pd.DataFrame()
+
+    ncols = min(4, len(drill_df))
+    nrows = (len(drill_df) + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols,
+                             figsize=(4.5 * ncols, 4.0 * nrows),
+                             squeeze=False)
+
+    for idx, (_, row) in enumerate(drill_df.iterrows()):
+        r, c  = divmod(idx, ncols)
+        ax    = axes[r][c]
+        fn    = row["filename"]
+        res   = phasor_cache[fn]
+        mask  = res["mask"]
+        G_sm  = res.get("G_sm", res["G_cal"])
+        S_sm  = res.get("S_sm", res["S_cal"])
+        ph    = res["photons"]
+        valid = mask & np.isfinite(G_sm) & np.isfinite(S_sm)
+
+        draw_semicircle(ax)
+        if valid.any():
+            hb = ax.hexbin(
+                G_sm[valid].ravel(), S_sm[valid].ravel(),
+                C=ph[valid].ravel(), reduce_C_function=np.sum,
+                gridsize=40, cmap="plasma", mincnt=1,
+            )
+            plt.colorbar(hb, ax=ax, fraction=0.046, pad=0.04)
+
+        # Cross at the per-file intensity-weighted mean
+        if fn in means_idx.index:
+            mx = means_idx.loc[fn, "G_cal_wmean"]
+            my = means_idx.loc[fn, "S_cal_wmean"]
+            ax.plot(mx, my, "w+", ms=10, mew=1.8, zorder=5)
+
+        ct    = str(row.get("cell_type", ""))
+        sess  = str(row.get("session_root", ""))[:8]
+        stem  = fn.rsplit("_", 1)[-1] if "_" in fn else fn
+        ax.set_title(f"{ct}  {sess}\n{stem}", fontsize=7)
+        ax.set_xlim(-0.05, 1.05)
+        ax.set_ylim(-0.05, 0.55)
+        ax.set_xlabel("G (cal)", fontsize=7)
+        ax.set_ylabel("S (cal)", fontsize=7)
+        ax.tick_params(labelsize=6)
+
+    for idx in range(len(drill_df), nrows * ncols):
+        r, c = divmod(idx, ncols)
+        axes[r][c].set_visible(False)
+
+    fig.suptitle(
+        f"Per-file phasor: {_drill_annot} / {DRILL_FIXATION} / {DRILL_EM_NM} nm"
+        f"  (n={len(drill_df)} files, white cross = file mean)",
+        fontsize=10,
     )
     plt.tight_layout()
     plt.show()
