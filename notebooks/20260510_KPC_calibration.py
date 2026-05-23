@@ -480,6 +480,10 @@ plt.show()
 # tightly at the tau_ref position. Spread reveals noise or bead drift.
 
 # %%
+# Filter chroma calibrations before QC plot (also used in Step 6 assignment)
+chroma_cal_df_filt = cluster_filter_irf(chroma_cal_df, IRF_CLUSTER_WIN_MIN)
+print(f"Chroma calibration timepoints after cluster filter: {len(chroma_cal_df_filt)}")
+
 sessions_c = sorted(chroma_cal_df_filt["session_root"].unique())
 colors_c   = plt.cm.tab10(np.linspace(0, 1, max(len(sessions_c), 1)))
 sc_col     = dict(zip(sessions_c, colors_c))
@@ -505,8 +509,8 @@ for sess in sessions_c:
     sub = chroma_cal_df_filt[chroma_cal_df_filt["session_root"] == sess]
     col   = sc_col[sess]
     label = sess.split("_")[0]
-    Gm = sub["G_mean"].values
-    Sm = sub["S_mean"].values
+    Gm = sub["G_meas"].values
+    Sm = sub["S_meas"].values
     ph = sub["phase_corr_rad"].values
     mo = sub["mod_corr"].values
     G_c = mo * (Gm * np.cos(ph) - Sm * np.sin(ph))

@@ -483,52 +483,91 @@ elif not CHANNEL_METRICS:
     print("No fit metrics available -- run Phase E first.")
 else:
     for metric in CHANNEL_METRICS:
-        label = METRIC_LABELS.get(metric, metric)
-        n_cols = len(fix_present) * len(channels)
-        fig, axes = plt.subplots(1, n_cols,
-                                 figsize=(3.2 * n_cols, 5),
-                                 squeeze=False)
-        ax_list = axes[0]
-        col_idx = 0
+        label   = METRIC_LABELS.get(metric, metric)
+        n_fix   = len(fix_present)
+        n_ct    = len(ct_present)
+        n_ch    = len(channels)
+        # positions: channel 0 at 0..n_ct-1, channel 1 at n_ct+1..2*n_ct,
+        # with a gap of 2 between groups; dashed line at x = n_ct - 0.5 + 1
+        gap     = 1.5
+        ch_offsets = [i * (n_ct + gap) for i in range(n_ch)]
 
-        for fix_type in fix_present:
-            for ch in channels:
-                ax  = ax_list[col_idx]
+        fig, axes = plt.subplots(1, n_fix, figsize=(max(5, 2.2 * n_ct * n_ch) * n_fix, 5),
+                                 squeeze=False)
+
+        for ax, fix_type in zip(axes[0], fix_present):
+            all_vals_by_ch = {}   # ch -> pooled values for channel-level significance
+
+            for ci, ch in enumerate(channels):
                 sub = (df[(df["fixation_type"] == fix_type) &
                           (df["em_filter_nm"]  == ch) &
                           df["cell_type"].isin(ct_present)]
                        .dropna(subset=[metric]))
                 cts_here = [ct for ct in ct_present
                             if (sub["cell_type"] == ct).any()]
-                groups   = [sub[sub["cell_type"] == ct][metric].values
-                            for ct in cts_here]
-                colors   = [ct_color[ct] for ct in cts_here]
+                all_vals_by_ch[ch] = sub[metric].values
 
-                if groups:
-                    parts = ax.violinplot(groups,
-                                          positions=range(len(groups)),
-                                          showmedians=True, showextrema=True)
-                    for pc, c in zip(parts["bodies"], colors):
-                        pc.set_facecolor(c); pc.set_alpha(0.65)
-                    for key2 in ("cmedians", "cbars", "cmins", "cmaxes"):
-                        if key2 in parts:
-                            parts[key2].set_color("k")
-                    rng = np.random.default_rng(seed=col_idx)
-                    for j, (grp, c) in enumerate(zip(groups, colors)):
-                        ax.scatter(j + rng.uniform(-0.07, 0.07, len(grp)),
-                                   grp, s=12, color=c, alpha=0.6, zorder=3)
-                    ax.set_xticks(range(len(cts_here)))
-                    ax.set_xticklabels(cts_here, fontsize=8)
-                else:
-                    ax.set_title("(no data)")
+                rng = np.random.default_rng(seed=ci)
+                for j, ct in enumerate(cts_here):
+                    grp  = sub[sub["cell_type"] == ct][metric].values
+                    pos  = ch_offsets[ci] + j
+                    col  = ct_color[ct]
+                    if len(grp) >= 2:
+                        parts = ax.violinplot([grp], positions=[pos],
+                                              showmedians=True, showextrema=True)
+                        for pc in parts["bodies"]:
+                            pc.set_facecolor(col); pc.set_alpha(0.65)
+                        for key2 in ("cmedians", "cbars", "cmins", "cmaxes"):
+                            if key2 in parts:
+                                parts[key2].set_color("k")
+                    elif len(grp) == 1:
+                        ax.plot(pos, grp[0], "o", color=col, ms=8, zorder=4)
+                    if len(grp) > 0:
+                        ax.scatter(pos + rng.uniform(-0.07, 0.07, len(grp)),
+                                   grp, s=12, color=col, alpha=0.7, zorder=5)
 
-                n_str = "  ".join(f"{ct}:{(sub['cell_type']==ct).sum()}"
-                                  for ct in cts_here)
-                ax.set_title(f"{fix_type}  {int(ch)} nm\nn={n_str}", fontsize=8)
-                ax.set_ylabel(label if col_idx == 0 else "")
-                col_idx += 1
+            # Dashed separator between channel groups
+            sep_x = ch_offsets[0] + n_ct - 0.5 + gap * 0.5
+            ylo, yhi = ax.get_ylim()
+            ax.axvline(sep_x, color="0.4", lw=1.2, ls="--", zorder=1)
 
-        fig.suptitle(f"{label}  by channel", fontsize=11)
+            # Channel significance: Mann-Whitney between the two channel pools
+            vals_ch = [all_vals_by_ch.get(ch, np.array([])) for ch in channels]
+            if len(vals_ch) == 2 and len(vals_ch[0]) >= 3 and len(vals_ch[1]) >= 3:
+                mw = stats.mannwhitneyu(vals_ch[0], vals_ch[1], alternative="two-sided")
+                if mw.pvalue < FDR_ALPHA:
+                    mid_y = ax.get_ylim()[1] * 0.97
+                    ax.text(sep_x, mid_y, "*",
+                            ha="center", va="top", fontsize=16, fontweight="bold",
+                            color="k")
+
+            # X-tick labels: cell-type labels under each violin, channel label above cluster
+            tick_pos   = []
+            tick_label = []
+            for ci, ch in enumerate(channels):
+                for j, ct in enumerate(ct_present):
+                    tick_pos.append(ch_offsets[ci] + j)
+                    tick_label.append(ct)
+                mid = ch_offsets[ci] + (n_ct - 1) / 2.0
+                ax.text(mid, ax.get_ylim()[0],
+                        f"{int(ch)} nm", ha="center", va="top",
+                        fontsize=8, color="0.35",
+                        transform=ax.get_xaxis_transform())
+
+            ax.set_xticks(tick_pos)
+            ax.set_xticklabels(tick_label, fontsize=8, rotation=30, ha="right")
+            ax.set_xlim(ch_offsets[0] - 0.8,
+                        ch_offsets[-1] + n_ct - 1 + 0.8)
+            ax.set_ylabel(label)
+            ax.set_title(fix_type, fontsize=9)
+
+        # Legend: cell type colours
+        handles_leg = [mpatches.Patch(color=ct_color[ct], label=ct)
+                       for ct in ct_present]
+        axes[0][-1].legend(handles=handles_leg, fontsize=8,
+                           bbox_to_anchor=(1.02, 1), loc="upper left")
+
+        fig.suptitle(f"{label}  by channel  (* = MW p < {FDR_ALPHA})", fontsize=11)
         plt.tight_layout()
         _savefig(fig, f"fig_channel_{metric}")
         plt.show()
