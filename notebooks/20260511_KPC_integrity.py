@@ -23,6 +23,9 @@ WIN_DATA_DIRS = [
     Path(r"E:\18_RK_Circadian\data\raw\20260509_KPC_fixed_dishes_on_SLIM"),
     Path(r"E:\18_RK_Circadian\data\raw\20260508_KPC_live_on_SLIM"),
     Path(r"E:\18_RK_Circadian\data\raw\20260517_KPC_live_on_SLIM"),
+    Path(r"E:\18_RK_Circadian\data\raw\20260520_KPC_fixed_dishes_SLIM"),
+    Path(r"E:\18_RK_Circadian\data\raw\20260521_KPC_live_SLIM"),
+    Path(r"E:\18_RK_Circadian\data\raw\20260522_KPC_fixed_dishes_SLIM"),
 ]
 LIN_DATA_DIRS = [
     Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260429_KPC_fixed_dishes_on_SLIM"),
@@ -30,6 +33,9 @@ LIN_DATA_DIRS = [
     Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260509_KPC_fixed_dishes_on_SLIM"),
     Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260508_KPC_live_on_SLIM"),
     Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260517_KPC_live_on_SLIM"),
+    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260520_KPC_fixed_dishes_SLIM"),
+    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260521_KPC_live_SLIM"),
+    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260522_KPC_fixed_dishes_SLIM"),
 ]
 CURRENT_OS = "Win"
 data_dirs = WIN_DATA_DIRS if CURRENT_OS == "Win" else LIN_DATA_DIRS
@@ -45,7 +51,8 @@ ORIENTATION_TRANSFORM = None    # confirmed in Step 8: SDT and SPCImage raw are 
 # Preferred number of fit components per fixation type (for selecting fit model
 # when multiple exports are present in fit_map.csv):
 #   glu:  3-component (ultra-short artifact a1 + two NADH components)
-#   form/live: 2-component (standard free/total NADH)
+#         If only 2-comp fits exist, best_fit_key() falls back automatically.
+#   form/live: 2-component (standard free/bound NADH)
 PREFERRED_N_COMP = {"glu": 3, "form": 2, "live": 2}
 
 # Amplitude ratio definition per fixation type:
@@ -56,6 +63,15 @@ RATIO_CFG = {
     "form": ("a1", "a2"),
     "live": ("a1", "a2"),
 }
+
+# Number of parallel workers for loading .asc files.
+# Each worker opens files concurrently; set to 1 to disable threading.
+LOAD_WORKERS = 8
+
+# Tau1 realism threshold (ps).  In a 2-component shift=0 fit of glu, tau1 values
+# below this are likely absorbing the ultra-short fixation artifact rather than
+# representing free NADH.  Used in Step 7 to flag unrealistic pixels.
+TAU1_REALISM_PS = 200.0
 
 # %%
 # -- Load Phase B outputs ---------------------------------------------------
@@ -141,44 +157,83 @@ def _load_asc(filepath: Path) -> dict | None:
     return {"param": param, "data": data}
 
 
-asc_paths = [fp for d in data_dirs for fp in sorted(d.rglob("*.asc"))]
-print(f"\nFound {len(asc_paths)} .asc files -- loading...")
+# Targeted parallel load.
+# 1. Collect every unique fit_set_key from fit_map_df (no dependency on
+#    sample_fits or best_fit_key, both defined later).
+# 2. Each key encodes the exact directory and base_stem, so we can use
+#    fit_dir.glob("*.asc") instead of rglob over the whole tree.
+# 3. ThreadPoolExecutor parallelises the text-file I/O across LOAD_WORKERS.
+#
+# Key format: "{session_root}::{rel_dir}::{base_stem}"
 
-# Key format matches Phase A: "{session_root}::{rel_dir}::{base_stem}"
-fit_data: dict[str, dict] = {}
-n_failures = n_skipped = 0
-for fp in asc_paths:
-    if re.search(r"_statistic", fp.stem, re.IGNORECASE):
-        n_skipped += 1
-        continue
-    result = _load_asc(fp)
-    if result is None:
-        n_failures += 1
-        continue
-    parent_dir   = next((d for d in data_dirs if str(fp).startswith(str(d))), None)
-    session_root = parent_dir.name if parent_dir else "unknown"
-    rel_dir      = str(fp.relative_to(parent_dir).parent) if parent_dir else str(fp.parent.name)
-    base         = _strip_param_suffix(fp.stem)
-    fit_set_key  = f"{session_root}::{rel_dir}::{base}"
-    fit_data.setdefault(fit_set_key, {
-        "_session_root": session_root,
-        "_folder":       rel_dir,
-        "_base_stem":    base,
-    })[result["param"]] = result["data"]
-    fit_data[fit_set_key][f"_path_{result['param']}"] = fp
+from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _asc
 
-print(f"Grouped into {len(fit_data)} fit sets  "
-      f"({n_skipped} statistics skipped, {n_failures} parse failures)")
+_all_keys: dict = {}  # fit_set_key -> (session_root, rel_dir, base_stem)
+for _, _row in fit_map_df.iterrows():
+    _fkey = str(_row["fit_set_key"])
+    if _fkey in _all_keys:
+        continue
+    try:
+        _sr, _rd, _bs = _fkey.split("::", 2)
+        _all_keys[_fkey] = (_sr, _rd, _bs)
+    except ValueError:
+        pass
+
+
+def _load_one_fit_set(args):
+    """Load .asc files for one fit set. Designed to run in a thread pool."""
+    fkey, sr, rd, bs = args
+    _sd = next((d for d in data_dirs if d.name == sr), None)
+    if _sd is None:
+        return fkey, None, "no_session"
+    fit_dir = _sd / Path(rd)
+    if not fit_dir.exists():
+        return fkey, None, "missing"
+    fd = {"_session_root": sr, "_folder": rd, "_base_stem": bs}
+    for fp in sorted(fit_dir.glob("*.asc")):
+        if re.search(r"_statistic", fp.stem, re.IGNORECASE):
+            continue
+        if _strip_param_suffix(fp.stem).lower() != bs.lower():
+            continue
+        res = _load_asc(fp)
+        if res:
+            fd[res["param"]] = res["data"]
+            fd[f"_path_{res['param']}"] = fp
+    return fkey, fd, "ok"
+
+
+_load_args = [(fkey, sr, rd, bs) for fkey, (sr, rd, bs) in _all_keys.items()]
+print(f"\nLoading {len(_load_args)} fit sets using {LOAD_WORKERS} workers...")
+
+fit_data: dict = {}
+_n_ok = _n_missing = 0
+with _TPE(max_workers=LOAD_WORKERS) as _pool:
+    _futures = {_pool.submit(_load_one_fit_set, a): a[0] for a in _load_args}
+    _done = 0
+    for _fut in _asc(_futures):
+        _fkey, _fd, _status = _fut.result()
+        _done += 1
+        if _fd is not None:
+            fit_data[_fkey] = _fd
+            _n_ok += 1
+        else:
+            _n_missing += 1
+        if _done % 100 == 0 or _done == len(_load_args):
+            print(f"  {_done}/{len(_load_args)} done...", end="\r", flush=True)
+
+print(f"\nLoaded {_n_ok} fit sets  ({_n_missing} dirs missing/not found)")
 
 # %%
 # Diagnostic: what param names actually loaded?
-all_found = sorted(set(k for fd in fit_data.values() for k in fd if not k.startswith("_")))
+all_found = sorted(set(k for fd in fit_data.values()
+                       for k in fd if not k.startswith("_")))
 print("Param names found across all fit_data entries:", all_found)
 
-print("\nSample .asc filenames (first 30):")
-for p in asc_paths[:30]:
-    print(f"  {p.name}  ->  inferred param: {_infer_param_name(p.stem)!r}  "
-          f"base: {_strip_param_suffix(p.stem)!r}")
+print("\nSample fit sets (first 3):")
+for _sample_key in list(fit_data.keys())[:3]:
+    _plist = [k for k in fit_data[_sample_key] if not k.startswith("_")]
+    print(f"  {_sample_key}")
+    print(f"    params: {_plist}")
 
 # Helper: select best fit_set_key for a file using fit_map_df + PREFERRED_N_COMP
 def best_fit_key(filename: str, fixation_type: str = None) -> str | None:
@@ -288,6 +343,106 @@ if shift_issues:
         print(f"  {s['filename']}: {s['nonzero_px']} px, max={s['max_abs']:.4f}")
 else:
     print("\nShift OK: zero (or not exported) for all sample files.")
+
+# Track which filenames have free (nonzero) shift -- used to split Steps 10-11.
+shift_nonzero_files = set(s["filename"] for s in shift_issues)
+print(f"\nShift groups: shift=0: {len(sample_fits) - len(shift_nonzero_files)}  "
+      f"shift!=0: {len(shift_nonzero_files)}")
+
+# %%
+# Save per-file shift statistics to results/shift_metadata.csv.
+# Columns: filename, fit_set_key, has_shift_export, shift_nonzero_px,
+#          shift_max_abs_ps, shift_mean_ps.
+# Downstream notebooks can merge this on filename to filter or split by shift mode.
+shift_meta_rows = []
+for _, row in sample_fits.iterrows():
+    fn  = row["filename"]
+    key = best_fit_key(fn, row.get("fixation_type"))
+    if key is None or key not in fit_data:
+        shift_meta_rows.append({
+            "filename": fn, "fit_set_key": key,
+            "has_shift_export": False,
+            "shift_nonzero_px": 0, "shift_max_abs_ps": np.nan,
+            "shift_mean_ps": np.nan, "shift_std_ps": np.nan,
+        })
+        continue
+    fd = fit_data[key]
+    has_shift = "shift" in fd
+    if has_shift:
+        arr = fd["shift"]
+        valid = np.isfinite(arr)
+        nz    = int(np.count_nonzero(np.nan_to_num(arr)))
+        mx    = float(np.nanmax(np.abs(arr))) if valid.any() else np.nan
+        mn    = float(np.nanmean(arr))        if valid.any() else np.nan
+        sd    = float(np.nanstd(arr))         if valid.any() else np.nan
+    else:
+        nz, mx, mn, sd = 0, np.nan, np.nan, np.nan
+    shift_meta_rows.append({
+        "filename":          fn,
+        "fit_set_key":       key,
+        "has_shift_export":  has_shift,
+        "shift_nonzero_px":  nz,
+        "shift_max_abs_ps":  mx,
+        "shift_mean_ps":     mn,
+        "shift_std_ps":      sd,
+    })
+
+shift_meta_df = pd.DataFrame(shift_meta_rows)
+# shift_meta_df is merged into fit_qc_summary.csv at the save step below.
+if not shift_meta_df.empty:
+    n_free = int((shift_meta_df["shift_nonzero_px"] > 0).sum())
+    print(f"  Files with nonzero shift: {n_free} / {len(shift_meta_df)}")
+    if n_free:
+        print(shift_meta_df[shift_meta_df["shift_nonzero_px"] > 0][
+            ["filename", "shift_nonzero_px", "shift_max_abs_ps", "shift_mean_ps"]
+        ].to_string())
+
+# %%
+# Tau1 realism check.
+# Fraction of valid pixels where tau1 < TAU1_REALISM_PS.
+# Elevated fractions (especially in glu shift=0 2-comp fits) indicate the short
+# component is absorbing the fixation artifact rather than free NADH.
+# Results are merged into fit_qc_summary.csv and plotted in Step 10.
+tau1_realism_rows = []
+for _, row in sample_fits.iterrows():
+    fn  = row["filename"]
+    fix = row.get("fixation_type")
+    key = best_fit_key(fn, fix)
+    rec = {
+        "filename":              fn,
+        "fixation_type":         fix,
+        "tau1_n_valid":          0,
+        "tau1_frac_lt_thresh":   np.nan,
+        "tau1_median_ps":        np.nan,
+    }
+    if key and key in fit_data:
+        fd = fit_data[key]
+        if "tau1" in fd:
+            arr   = fd["tau1"]
+            valid = np.isfinite(arr) & (arr > 0)
+            n     = int(valid.sum())
+            if n > 0:
+                vals = arr[valid]
+                rec["tau1_n_valid"]        = n
+                rec["tau1_frac_lt_thresh"] = float((vals < TAU1_REALISM_PS).mean())
+                rec["tau1_median_ps"]      = float(np.median(vals))
+    tau1_realism_rows.append(rec)
+
+tau1_df = pd.DataFrame(tau1_realism_rows)
+# Merge shift group label for printing
+tau1_df["shift_group"] = tau1_df["filename"].apply(
+    lambda fn: "shift!=0" if fn in shift_nonzero_files else "shift=0"
+)
+
+print(f"\nTau1 realism check  (threshold = {TAU1_REALISM_PS} ps):")
+print(tau1_df.groupby(["fixation_type", "shift_group"])[
+    ["tau1_frac_lt_thresh", "tau1_median_ps"]
+].mean().round(3).to_string())
+high = tau1_df[tau1_df["tau1_frac_lt_thresh"] > 0.3]
+if not high.empty:
+    print(f"\n  {len(high)} file(s) with >30% pixels below threshold:")
+    print(high[["filename", "fixation_type", "shift_group",
+                "tau1_frac_lt_thresh", "tau1_median_ps"]].to_string())
 
 # %% [markdown]
 # ## Step 8: Orientation verification
@@ -463,48 +618,97 @@ for ft in fix_types:
 
 # %%
 for fix_type in ["glu", "form", "live"]:
-    rows = sample_fits[sample_fits["fixation_type"] == fix_type]
-    if rows.empty:
+    all_rows = sample_fits[sample_fits["fixation_type"] == fix_type]
+    if all_rows.empty:
         continue
 
     params_show = (["tau1", "tau2", "tau3", "a1", "a2", "a3", "chi2"]
                    if fix_type == "glu"
                    else ["tau1", "tau2", "a1", "a2", "chi2"])
 
-    fig, axes = plt.subplots(1, len(params_show),
-                             figsize=(3 * len(params_show), 3), squeeze=False)
+    # Split into shift=0 and shift-free subgroups; only add a group if non-empty.
+    shift_groups = []
+    _r0  = all_rows[~all_rows["filename"].isin(shift_nonzero_files)]
+    _rnz = all_rows[ all_rows["filename"].isin(shift_nonzero_files)]
+    if not _r0.empty:
+        shift_groups.append(("shift=0",  _r0))
+    if not _rnz.empty:
+        shift_groups.append(("shift!=0", _rnz))
 
-    for ax, param in zip(axes[0], params_show):
-        arrays = []
-        for _, row in rows.iterrows():
-            key = best_fit_key(row["filename"], row.get("fixation_type"))
-            if key is None or key not in fit_data:
+    for shift_label, rows in shift_groups:
+        fig, axes = plt.subplots(1, len(params_show),
+                                 figsize=(3 * len(params_show), 3), squeeze=False)
+
+        for ax, param in zip(axes[0], params_show):
+            arrays = []
+            for _, row in rows.iterrows():
+                key = best_fit_key(row["filename"], row.get("fixation_type"))
+                if key is None or key not in fit_data:
+                    continue
+                fd = fit_data[key]
+                if param not in fd:
+                    continue
+                arr = apply_orientation(fd[param], ORIENTATION_TRANSFORM).ravel()
+                arrays.append(arr[np.isfinite(arr)])
+
+            if not arrays:
+                ax.set_title(f"{param}\n(no data)")
                 continue
-            fd = fit_data[key]
-            if param not in fd:
+
+            vals = np.concatenate(arrays)
+            if param.startswith("a"):
+                lo, hi = 0.0, 1.0
+            elif param == "chi2":
+                lo, hi = 0.0, 5.0
+            else:
+                lo = float(np.percentile(vals[vals > 0], 1)) if (vals > 0).any() else 0
+                hi = float(np.percentile(vals, 99))
+
+            ax.hist(vals, bins=80, range=(lo, hi), density=True,
+                    color="steelblue", alpha=0.8)
+            ax.set_xlabel(param)
+            ax.set_title(f"{param}\nmedian={np.nanmedian(vals):.4g}")
+
+        fig.suptitle(
+            f"Fit parameters -- {fix_type}  ({len(rows)} files)  [{shift_label}]",
+            fontsize=10,
+        )
+        plt.tight_layout()
+        plt.show()
+
+# %%
+# Tau1 realism summary plot: fraction of pixels below TAU1_REALISM_PS,
+# shown per file as a scatter, grouped by fixation_type and shift_group.
+# High fractions in glu shift=0 indicate the short component is absorbing
+# the fixation artifact.  Expect lower fractions with 3-comp or free-shift fits.
+if not tau1_df.empty and tau1_df["tau1_frac_lt_thresh"].notna().any():
+    _fix_types = sorted(tau1_df["fixation_type"].dropna().unique())
+    _sg_colors = {"shift=0": "steelblue", "shift!=0": "darkorange"}
+
+    fig, axes = plt.subplots(1, len(_fix_types),
+                             figsize=(4 * len(_fix_types), 4), squeeze=False)
+    for ax, ft in zip(axes[0], _fix_types):
+        sub = tau1_df[tau1_df["fixation_type"] == ft].dropna(
+            subset=["tau1_frac_lt_thresh"]
+        )
+        for sg, color in _sg_colors.items():
+            s = sub[sub["shift_group"] == sg]
+            if s.empty:
                 continue
-            arr = apply_orientation(fd[param], ORIENTATION_TRANSFORM).ravel()
-            arrays.append(arr[np.isfinite(arr)])
-
-        if not arrays:
-            ax.set_title(f"{param}\n(no data)")
-            continue
-
-        vals = np.concatenate(arrays)
-        if param.startswith("a"):
-            lo, hi = 0.0, 1.0
-        elif param == "chi2":
-            lo, hi = 0.0, 5.0
-        else:
-            lo = float(np.percentile(vals[vals > 0], 1)) if (vals > 0).any() else 0
-            hi = float(np.percentile(vals, 99))
-
-        ax.hist(vals, bins=80, range=(lo, hi), density=True,
-                color="steelblue", alpha=0.8)
-        ax.set_xlabel(param)
-        ax.set_title(f"{param}\nmedian={np.nanmedian(vals):.4g}")
-
-    fig.suptitle(f"Fit parameters -- {fix_type}  ({len(rows)} files)", fontsize=10)
+            ax.scatter(
+                [sg] * len(s), s["tau1_frac_lt_thresh"],
+                color=color, alpha=0.7, s=30, label=sg,
+            )
+            ax.axhline(s["tau1_frac_lt_thresh"].mean(), color=color,
+                       lw=1.5, linestyle="--", alpha=0.8)
+        ax.axhline(0.3, color="red", lw=1, linestyle=":", alpha=0.6,
+                   label="30% flag level")
+        ax.set_ylim(-0.05, 1.05)
+        ax.set_ylabel(f"frac tau1 < {TAU1_REALISM_PS:.0f} ps")
+        ax.set_title(ft)
+        ax.legend(fontsize=7)
+    fig.suptitle("Tau1 realism check by fixation type and shift group",
+                 fontsize=10)
     plt.tight_layout()
     plt.show()
 
@@ -515,57 +719,93 @@ for fix_type in ["glu", "form", "live"]:
 # Ratio convention set by RATIO_CFG at the top:
 #   glu:       a2/(a2+a3)  -- fraction of non-artifact signal in shorter component
 #   form/live: a1/(a1+a2)  -- fraction of total NADH signal in shorter component
+#
+# Results are shown separately for shift=0 and shift!=0 fits so the effect of
+# allowing a free IRF shift can be assessed.
 
 # %%
 for fix_type, (num_p, den_p) in RATIO_CFG.items():
-    rows = sample_fits[sample_fits["fixation_type"] == fix_type]
-    if rows.empty:
+    all_rows = sample_fits[sample_fits["fixation_type"] == fix_type]
+    if all_rows.empty:
         continue
 
-    ratio_maps = []
-    for _, row in rows.iterrows():
-        key = best_fit_key(row["filename"], row.get("fixation_type"))
-        if key is None or key not in fit_data:
-            continue
-        fd = fit_data[key]
-        if num_p not in fd or den_p not in fd:
-            continue
-        a_n = apply_orientation(fd[num_p], ORIENTATION_TRANSFORM)
-        a_d = apply_orientation(fd[den_p], ORIENTATION_TRANSFORM)
-        denom = a_n + a_d
-        with np.errstate(invalid="ignore", divide="ignore"):
-            ratio = np.where(denom > 0, a_n / denom, np.nan)
-        ratio_maps.append(ratio)
-
-    if not ratio_maps:
-        print(f"  {fix_type}: no data for {num_p}/({num_p}+{den_p})")
-        continue
+    _r0  = all_rows[~all_rows["filename"].isin(shift_nonzero_files)]
+    _rnz = all_rows[ all_rows["filename"].isin(shift_nonzero_files)]
+    shift_groups_r = []
+    if not _r0.empty:
+        shift_groups_r.append(("shift=0",  _r0))
+    if not _rnz.empty:
+        shift_groups_r.append(("shift!=0", _rnz))
 
     label = f"{num_p}/({num_p}+{den_p})"
-    flat  = np.concatenate([m.ravel() for m in ratio_maps])
-    flat  = flat[np.isfinite(flat)]
 
-    fig, (ax_map, ax_hist) = plt.subplots(1, 2, figsize=(10, 4))
+    for shift_label, rows in shift_groups_r:
+        ratio_maps = []
+        for _, row in rows.iterrows():
+            key = best_fit_key(row["filename"], row.get("fixation_type"))
+            if key is None or key not in fit_data:
+                continue
+            fd = fit_data[key]
+            if num_p not in fd or den_p not in fd:
+                continue
+            a_n = apply_orientation(fd[num_p], ORIENTATION_TRANSFORM)
+            a_d = apply_orientation(fd[den_p], ORIENTATION_TRANSFORM)
+            denom = a_n + a_d
+            with np.errstate(invalid="ignore", divide="ignore"):
+                ratio = np.where(denom > 0, a_n / denom, np.nan)
+            ratio_maps.append(ratio)
 
-    im = ax_map.imshow(ratio_maps[0], cmap="RdBu_r", vmin=0, vmax=1)
-    plt.colorbar(im, ax=ax_map, label=label)
-    ax_map.set_title(f"{fix_type}: ratio map (first file)")
-    ax_map.axis("off")
+        if not ratio_maps:
+            print(f"  {fix_type} [{shift_label}]: no data for {num_p}/({num_p}+{den_p})")
+            continue
 
-    ax_hist.hist(flat, bins=80, range=(0, 1), density=True,
-                 color="steelblue", alpha=0.8)
-    ax_hist.set_xlabel(label)
-    ax_hist.set_ylabel("density")
-    ax_hist.set_title(f"{fix_type}: all files (n={len(ratio_maps)})\n"
-                      f"mean={flat.mean():.3f}  median={np.median(flat):.3f}  "
-                      f"std={flat.std():.3f}")
-    plt.tight_layout()
-    plt.show()
+        flat = np.concatenate([m.ravel() for m in ratio_maps])
+        flat = flat[np.isfinite(flat)]
+
+        fig, (ax_map, ax_hist) = plt.subplots(1, 2, figsize=(10, 4))
+
+        im = ax_map.imshow(ratio_maps[0], cmap="RdBu_r", vmin=0, vmax=1)
+        plt.colorbar(im, ax=ax_map, label=label)
+        ax_map.set_title(f"{fix_type} [{shift_label}]: ratio map (first file)")
+        ax_map.axis("off")
+
+        ax_hist.hist(flat, bins=80, range=(0, 1), density=True,
+                     color="steelblue", alpha=0.8)
+        ax_hist.set_xlabel(label)
+        ax_hist.set_ylabel("density")
+        ax_hist.set_title(
+            f"{fix_type} [{shift_label}]: n={len(ratio_maps)} files\n"
+            f"mean={flat.mean():.3f}  median={np.median(flat):.3f}  "
+            f"std={flat.std():.3f}"
+        )
+        plt.tight_layout()
+        plt.show()
 
 # %%
-# Save chi^2 summary to results
-chi2_df.to_csv(results_dir / "chi2_summary.csv", index=False)
-print(f"Saved chi^2 summary to {results_dir / 'chi2_summary.csv'}")
+# Save all Phase C per-file quality stats to fit_qc_summary.csv.
+# Merges chi2 stats, shift stats, and tau1 realism stats on filename.
+_qc = chi2_df.copy()
+
+_shift_cols = ["filename", "fit_set_key", "has_shift_export",
+               "shift_nonzero_px", "shift_max_abs_ps",
+               "shift_mean_ps", "shift_std_ps"]
+if "shift_meta_df" in dir() and not shift_meta_df.empty:
+    _qc = _qc.merge(
+        shift_meta_df[[c for c in _shift_cols if c in shift_meta_df.columns]],
+        on="filename", how="left",
+    )
+
+_tau1_cols = ["filename", "tau1_n_valid", "tau1_frac_lt_thresh", "tau1_median_ps"]
+if "tau1_df" in dir() and not tau1_df.empty:
+    _qc = _qc.merge(
+        tau1_df[[c for c in _tau1_cols if c in tau1_df.columns]],
+        on="filename", how="left",
+    )
+
+_qc_path = results_dir / "fit_qc_summary.csv"
+_qc.to_csv(_qc_path, index=False)
+print(f"Saved fit_qc_summary: {len(_qc)} rows, {len(_qc.columns)} columns -> {_qc_path}")
+print(f"  Columns: {_qc.columns.tolist()}")
 
 # %% [markdown]
 # ## Step 12: Position annotation template
@@ -635,13 +875,19 @@ print(annot_df[["filename", "fixation_type", "frame_index",
 # %% [markdown]
 # ### Step 12b: Side-by-side intensity browser
 #
-# Loop through matching positions (same session + sample_index + frame_index) and display
-# transmitted-light (TD), 457/50 nm, and 535/50 nm intensity images side by side.
-# Use this to decide the "annotation" label for each position.
+# Loop through matching positions (same session + sample_index + frame_index + pockels)
+# and display transmitted-light (TD), 457/50 nm, and 535/50 nm intensity images side
+# by side. Pockels is included in the group key so that files at different power
+# settings (e.g. poc0p25 vs poc0p6) each appear as a separate position row.
+#
+# Set SHOW_ONLY_UNANNOTATED = True (default) to skip positions that already have
+# an annotation in position_annotation.csv.
 #
 # Tip: run this once, keep the figure window open, then fill position_annotation.csv.
 
 # %%
+SHOW_ONLY_UNANNOTATED = True   # False to show all positions (including annotated)
+
 def _channel_label(em_nm) -> str:
     """Return TD / 457 / 535 / or numeric label from em_filter_nm."""
     if pd.isna(em_nm):
@@ -663,14 +909,37 @@ def _channel_label(em_nm) -> str:
 sample_sdt = sdt_df[sdt_df["file_type"] == "sample"].copy()
 sample_sdt["_ch"] = sample_sdt["em_filter_nm"].apply(_channel_label)
 
-_group_cols = [c for c in ["session_root", "sample_index", "frame_index"]
+# Include pockels in the grouping key so different power settings are shown
+# separately (each warrants its own annotation entry).
+_group_cols = [c for c in ["session_root", "sample_index", "frame_index", "pockels"]
                if c in sample_sdt.columns]
 grouped = sample_sdt.groupby(_group_cols, dropna=False)
 print(f"Positions found: {len(grouped)}\n")
 
+# Pre-load existing annotations so we can skip already-annotated positions.
+_existing_annot: dict = {}
+if SHOW_ONLY_UNANNOTATED and annot_path.exists():
+    _ea = pd.read_csv(annot_path)
+    _existing_annot = dict(zip(
+        _ea["filename"].astype(str),
+        _ea["annotation"].fillna("").astype(str),
+    ))
+    print(f"Loaded {len(_existing_annot)} existing annotations; "
+          "will skip fully-annotated positions.")
+
 _CH_ORDER = ["TD", "457", "535"]
+_n_shown = _n_skipped_annot = 0
 
 for pos_key, grp in grouped:
+    # If SHOW_ONLY_UNANNOTATED, skip groups where every file already has a
+    # non-empty annotation.
+    if SHOW_ONLY_UNANNOTATED and _existing_annot:
+        group_fns = grp["filename"].astype(str).tolist()
+        all_done  = all(_existing_annot.get(fn, "") != "" for fn in group_fns)
+        if all_done:
+            _n_skipped_annot += 1
+            continue
+
     ch_map = {}
     for _, row in grp.iterrows():
         ch = row["_ch"]
@@ -711,6 +980,36 @@ for pos_key, grp in grouped:
     plt.show()
     fn_list = [ch_map[c]["filename"] for c in present]
     print(f"  {pos_str}  ->  {fn_list}")
+    _n_shown += 1
+
+print(f"\nShown: {_n_shown}  |  Skipped (already annotated): {_n_skipped_annot}")
+
+# %% [markdown]
+# ### Step 12c: Propagate laser-damage flag from annotation notes
+#
+# If you noted "laser damage" (or similar) in the notes column while annotating,
+# this cell adds a boolean `laser_damage` column to position_annotation.csv so
+# downstream notebooks can easily exclude those files.
+
+# %%
+if annot_path.exists():
+    _ann = pd.read_csv(annot_path)
+    if "notes" in _ann.columns:
+        _damage_kw = re.compile(
+            r"laser.?damage|damaged|overexposed|bleach|burn",
+            re.IGNORECASE,
+        )
+        _ann["laser_damage"] = (
+            _ann["notes"].fillna("").apply(lambda n: bool(_damage_kw.search(n)))
+        )
+        _ann.to_csv(annot_path, index=False)
+        _n_damage = int(_ann["laser_damage"].sum())
+        print(f"laser_damage column written to {annot_path}: "
+              f"{_n_damage} file(s) flagged")
+    else:
+        print("No 'notes' column found in annotation CSV; skipping laser_damage flag.")
+else:
+    print(f"Annotation file not found: {annot_path}")
 
 # %% [markdown]
 # ## Summary
@@ -730,7 +1029,12 @@ for pos_key, grp in grouped:
 #   results/fit_map.csv  -- fit-set/SDT pairs with n_components (written by Phase A)
 #
 # Saved:
-#   results/chi2_summary.csv
+#   results/fit_qc_summary.csv  -- all Phase C per-file quality stats (merged)
+#     columns: filename, fixation_type,
+#              chi2_mean, chi2_median, frac_hi,
+#              fit_set_key, has_shift_export, shift_nonzero_px,
+#                shift_max_abs_ps, shift_mean_ps, shift_std_ps,
+#              tau1_n_valid, tau1_frac_lt_thresh, tau1_median_ps
 #   results/position_annotation.csv  -- fill annotation column before Phase D
 #
 # Before Phase D:
