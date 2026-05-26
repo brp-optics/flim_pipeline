@@ -70,6 +70,12 @@ ANNOTATION_REMAP = {
 # Annotation groups to exclude from plots entirely
 ANNOTATION_EXCLUDE = {"no_cells", "(unannotated)"}
 
+# If True, only files whose Phase C shift_nonzero_px == 0 (shift-zero fit) are
+# included in the phasor analysis and written to sdt_phasor_summary.csv.
+# Requires results/fit_qc_summary.csv (written by Phase C).
+# Set False to include all files regardless of IRF shift mode.
+REQUIRE_SHIFT_ZERO = True
+
 # %%
 # -- Load Phase A/B outputs -------------------------------------------------
 results_dir = Path("../results")
@@ -127,6 +133,27 @@ sample_df = sdt_df[
     sdt_df["em_filter_nm"].isin(PHASOR_EM_FILTERS) &
     sdt_df["phasor_cal_phase_rad"].notna()
 ].copy()
+
+if REQUIRE_SHIFT_ZERO:
+    _qc_path = results_dir / "fit_qc_summary.csv"
+    if _qc_path.exists():
+        _qc = pd.read_csv(_qc_path)[["filename", "shift_nonzero_px"]].drop_duplicates("filename")
+        sample_df = sample_df.merge(_qc, on="filename", how="left")
+        # Treat missing shift_nonzero_px as 0 (no Phase C data -> assume shift=0)
+        sample_df["shift_nonzero_px"] = pd.to_numeric(
+            sample_df["shift_nonzero_px"], errors="coerce"
+        ).fillna(0)
+        _sz_mask = sample_df["shift_nonzero_px"] == 0
+        _n_dropped = (~_sz_mask).sum()
+        if _n_dropped:
+            print(f"REQUIRE_SHIFT_ZERO: dropping {_n_dropped} files with shift_nonzero_px > 0:")
+            for _fn in sample_df.loc[~_sz_mask, "filename"]:
+                print(f"  {_fn}")
+        sample_df = sample_df[_sz_mask].copy()
+        print(f"REQUIRE_SHIFT_ZERO: {len(sample_df)} files remain")
+    else:
+        print(f"REQUIRE_SHIFT_ZERO: fit_qc_summary.csv not found -- "
+              f"run Phase C first; including all files for now")
 
 print(f"\nSample files for phasor analysis: {len(sample_df)}")
 print(sample_df.groupby(

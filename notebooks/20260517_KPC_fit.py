@@ -1,21 +1,129 @@
 # %% [markdown]
-# # Phase E: Fit parameter analysis
+# # Phase E: Quality masking and per-image FLIM statistics
 #
-# Requires: Phase A outputs (sdt_metadata_cal.csv, fit_map.csv) and SPCImage
-# exports of a1, tau1, a2, tau2, a3 (glu only), tau3 (glu only), chi, photons.
+# This notebook does NOT perform curve fitting.  The fluorescence lifetime decays
+# were fitted in SPCImage (Becker & Hickl) using iterative reconvolution with the
+# experimentally measured IRF.  Phase E imports per-pixel parameter maps that
+# SPCImage exported as .asc text grids and applies post-hoc quality masking and
+# summary statistics.
 #
-# Steps:
-# 14. Load Phase A/B outputs; define all helpers
-# 15. Per-image quality masking (all fit sets):
-#     a. Box-kernel smoothed photon count >= MIN_PHOTONS_SMOOTHED
-#     b. Chi^2 in [CHI2_LO, CHI2_HI]
-#     c. All amplitudes >= 0 and amplitude sum > 0
-#     d. Tau values within physical NADH bounds (ps)
-#     Saves {base_stem}_fit_mask.npy and fit_quality_summary.csv
-#     in each fit export folder (one file per fit attempt).
-# 16. Amplitude-weighted tau_mean spatial maps (preferred fit model per file)
-# 17. tau_mean and amplitude ratio distributions by fixation_type
+# -----------------------------------------------------------------------
+# What was fitted, and how
+# -----------------------------------------------------------------------
+#
+# glu (glutaraldehyde-fixed cells)
+#   Model: 3-component exponential decay, I(t) = a1*exp(-t/tau1)
+#                                                + a2*exp(-t/tau2)
+#                                                + a3*exp(-t/tau3)
+#   SPCImage sorts components by lifetime (tau1 < tau2 < tau3), so:
+#     a1, tau1 : ultra-short glutaraldehyde fixation artifact (~16-30 ps)
+#     a2, tau2 : free NADH, shorter-lived component (~300-700 ps)
+#     a3, tau3 : protein-bound NADH, longer-lived component (~1500-3000 ps)
+#   Amplitudes are fractional (SPCImage normalises so a1+a2+a3 = 1).
+#   IRF shift: fixed to zero for most acquisitions; some files used a free
+#   shift (see shift_group column derived from Phase C).
+#
+# form (formaldehyde-fixed cells), live
+#   Model: 2-component exponential decay.
+#     a1, tau1 : free NADH
+#     a2, tau2 : protein-bound NADH
+#   Amplitudes normalised (a1+a2 = 1).
+#
+# -----------------------------------------------------------------------
+# Spatial binning
+# -----------------------------------------------------------------------
+# SPCImage sums the decay photons over a (2b+1)x(2b+1) box kernel before
+# fitting (bin radius b encoded in the fit folder name, e.g. "b5" => b=5,
+# kernel 11x11).  The exported per-pixel parameter maps assign the fit
+# result to every pixel in the binned neighbourhood.  Consequently:
+#   - The photon threshold in criterion 1 is applied to the BINNED total
+#     (approximated as uniform_filter(photons, 2b+1) * (2b+1)^2).
+#   - Neighbouring pixels within one kernel radius share the same fit result
+#     and are not statistically independent.
+#
+# -----------------------------------------------------------------------
+# Per-pixel quality criteria -- ALL must pass (Step 15)
+# -----------------------------------------------------------------------
+# 1. Binned photon count >= MIN_PHOTONS_BY_NCOMP
+#      3-comp : 8,000 photons   (more components need more photons)
+#      2-comp : 3,000 photons
+#      1-comp :   500 photons
+#      unknown: 3,000 photons
+#    If photons.asc is absent, SDT file is loaded as fallback.
+#    If neither is available, ALL pixels pass this criterion.
+#
+# 2. Reduced chi-squared: CHI2_LO <= chi^2 <= CHI2_HI  [0.8, 2.0]
+#      chi^2 < 0.8 : over-fitting or too few photons (Poisson noise dominated)
+#      chi^2 > 2.0 : systematic model mismatch or poor convergence
+#    If chi.asc is absent, ALL pixels pass.
+#
+# 3. Amplitude positivity: every exported amplitude component (a1, a2, a3
+#    where present) >= 0, AND their sum > 0.
+#    SPCImage zero-fills pixels where the fit did not converge.
+#
+# 4. Tau physical bounds (TAU_BOUNDS, ps):
+#      glu  : tau1 in [0, 200]    -- artifact; tau1 > 200 ps means the
+#                                    fit did not resolve the artifact component
+#             tau2 in [50, 1200]  -- free NADH
+#             tau3 in [800, 6000] -- bound NADH
+#      form : tau1 in [50, 1500]  -- free NADH
+#             tau2 in [800, 6000] -- bound NADH
+#      live : same as form
+#    Any pixel where a present tau component falls outside its bound is rejected.
+#
+# 5. tau_mean physical bounds (TAU_MEAN_BOUNDS, ps):
+#      live ONLY: tau_mean >= 250 ps
+#      glu, form: no tau_mean filter applied
+#    Motivation for live: removes punctate very-short-lifetime pixels
+#    (lipid droplets, collapsed fits) without tightening component bounds.
+#    CAUTION: this is an ASYMMETRIC criterion -- live data has an extra
+#    exclusion not applied to glu or form.  Verify this does not bias
+#    live comparisons relative to fixed conditions.
+#
+# -----------------------------------------------------------------------
+# Output metrics (quality-masked pixels only)
+# -----------------------------------------------------------------------
+# tau_mean (ps): amplitude-weighted mean lifetime, excluding artifact.
+#   glu  : (a2*tau2 + a3*tau3) / (a2+a3)
+#          a1/tau1 are EXCLUDED from this average.
+#          CAUTION: if a3/tau3 are absent (2-comp fallback file), compute_tau_mean
+#          returns None and the file contributes NaN to tau_mean columns.
+#          Such files are silently absent from tau_mean comparisons.
+#   form, live: (a1*tau1 + a2*tau2) / (a1+a2)
+#
+# amp_ratio (unitless): RATIO of two amplitude components (NOT a fraction).
+#   glu  : a2 / a3   (free NADH amplitude / bound NADH amplitude)
+#   form, live: a1 / a2
+#   Typical ranges: glu a2/a3 ~ 1-5;  form/live a1/a2 ~ 0.5-2.
+#   VALUES CAN EXCEED 1.  To obtain the normalised free-NADH fraction use
+#   num / (num + den) on the raw amplitude maps.
+#   CAUTION: Step 17 histogram and groups notebook violin plots display
+#   this ratio on its natural scale, not clamped to [0, 1].
+#
+# -----------------------------------------------------------------------
+# Exclusions written to fit_analysis_summary.csv (Step 18)
+# -----------------------------------------------------------------------
+# - Files with < 1% pixel retention are logged in low_retention_warnings.txt
+#   and EXCLUDED from fit_analysis_summary.csv.
+# - glu files where tau_mean = NaN (2-comp fallback) appear in the CSV
+#   but contribute NaN to tau_mean columns.
+# - n_components is stored as an explicit integer column (parsed from the
+#   fit folder name by parse_fit_folder).  Phase F reads this column
+#   directly; it no longer needs to re-parse fit_set_key strings.
+#
+# -----------------------------------------------------------------------
+# Steps
+# -----------------------------------------------------------------------
+# 14. Load Phase A/B outputs; define helpers
+# 15. Quality masking (all fit sets) -> {base_stem}_fit_mask.npy per folder
+#     15b. Failure diagnosis
+#     15c. Chi^2 distribution check
+# 16. tau_mean spatial maps (preferred fit model per file)
+# 17. tau_mean and amplitude ratio distributions (split by shift_group x n_comp)
 # 18. Per-file summary stats -> results/fit_analysis_summary.csv
+#
+# FORCE_RECOMPUTE must be True whenever TAU_BOUNDS, CHI2_LO/HI, or
+# MIN_PHOTONS_BY_NCOMP are changed; otherwise cached .npy masks are reused.
 
 # %%
 from pathlib import Path
@@ -72,8 +180,9 @@ CHI2_HI = 2.0
 #   form/live: tau1 = free NADH, tau2 = bound NADH
 TAU_BOUNDS = {
     "glu": {
-        "tau1": (50.0,  1500.0),    # free NADH (2-comp: no artifact component)
-        "tau2": (800.0, 6000.0),    # bound NADH
+        "tau1": (0.0,    200.0),    # ultra-short glutaraldehyde artifact component
+        "tau2": (50.0,  1200.0),    # free NADH
+        "tau3": (800.0, 6000.0),    # bound NADH
     },
     "form": {
         "tau1": (50.0,  1500.0),    # free NADH
@@ -87,10 +196,10 @@ TAU_BOUNDS = {
 
 # Amplitude-weighted tau_mean components per fixation_type.
 # Pairs of (amplitude_key, lifetime_key) to include in the weighted average.
-#   glu:       (a2*tau2 + a3*tau3) / (a2+a3)  -- skip artifact component a1
+#   glu:       (a2*tau2 + a3*tau3) / (a2+a3)  -- skip ultra-short artifact a1
 #   form/live: (a1*tau1 + a2*tau2) / (a1+a2)
 TAUMEAN_CFG = {
-    "glu":  (("a1", "tau1"), ("a2", "tau2")),
+    "glu":  (("a2", "tau2"), ("a3", "tau3")),
     "form": (("a1", "tau1"), ("a2", "tau2")),
     "live": (("a1", "tau1"), ("a2", "tau2")),
 }
@@ -108,14 +217,15 @@ TAU_MEAN_BOUNDS = {
 }
 
 # Amplitude ratio (numerator component, denominator component)
+# glu: a2/(a2+a3) -- free/total NADH excluding the artifact component
 RATIO_CFG = {
-    "glu":  ("a1", "a2"),
+    "glu":  ("a2", "a3"),
     "form": ("a1", "a2"),
     "live": ("a1", "a2"),
 }
 
 # Preferred number of fit components per fixation_type (for Steps 16-18)
-PREFERRED_N_COMP = {"glu": 2, "form": 2, "live": 2}
+PREFERRED_N_COMP = {"glu": 3, "form": 2, "live": 2}
 
 # %% [markdown]
 # ## Step 14: Load outputs and define helpers
@@ -287,8 +397,25 @@ def load_saved_mask(fit_set_key: str) -> np.ndarray | None:
     return np.load(str(p)) if p.exists() else None
 
 
+def _prefer_shift_zero(candidates) -> str:
+    """Among candidate rows, return the fit_set_key of the shift-zero folder.
+
+    Prefers rows whose key contains '-sz-' (SPCImage shift=zero) over '-sf-'
+    (shift=free).  Falls back to the first row if no '-sz-' match exists.
+    """
+    sz_rows = candidates[candidates["fit_set_key"].str.contains("-sz-", case=False, na=False)]
+    chosen  = sz_rows if not sz_rows.empty else candidates
+    return str(chosen.iloc[0]["fit_set_key"])
+
+
 def best_fit_key(filename: str, fixation_type: str = None) -> str | None:
-    """Return the preferred fit_set_key for a file using PREFERRED_N_COMP."""
+    """Return the preferred fit_set_key for a file using PREFERRED_N_COMP.
+
+    Selection priority:
+      1. Match PREFERRED_N_COMP[fixation_type]; among ties prefer shift-zero folder.
+      2. Else: highest n_components; among ties prefer shift-zero folder.
+      3. Else: first row.
+    """
     rows = fit_map_df[fit_map_df["sdt_filename"] == filename]
     if rows.empty:
         return None
@@ -296,10 +423,12 @@ def best_fit_key(filename: str, fixation_type: str = None) -> str | None:
     if preferred is not None and "n_components" in rows.columns:
         exact = rows[rows["n_components"] == preferred]
         if not exact.empty:
-            return str(exact.iloc[0]["fit_set_key"])
+            return _prefer_shift_zero(exact)
     if "n_components" in rows.columns:
-        return str(rows.sort_values("n_components", ascending=False).iloc[0]["fit_set_key"])
-    return str(rows.iloc[0]["fit_set_key"])
+        best_nc = rows["n_components"].max()
+        top     = rows[rows["n_components"] == best_nc]
+        return _prefer_shift_zero(top)
+    return _prefer_shift_zero(rows)
 
 
 # -- Helpers: masking and analysis ------------------------------------------
@@ -435,6 +564,12 @@ def compute_tau_mean(fd: dict, fixation_type: str) -> np.ndarray | None:
 # Set True to ignore the cache and reprocess every fit set from scratch.
 # Needed when TAU_BOUNDS, CHI2_LO/HI, or MIN_PHOTONS_BY_NCOMP change.
 FORCE_RECOMPUTE = True
+
+# If True, only files whose best_fit_key resolves to a shift-zero (sz) folder
+# are included in Steps 16-18 and written to fit_analysis_summary.csv.
+# Files with only shift-free (sf) fits are skipped with a printed warning.
+# Set False to fall back to sf fits when no sz folder exists.
+REQUIRE_SHIFT_ZERO = True
 
 sample_filenames = set(sdt_df.loc[sdt_df["file_type"] == "sample", "filename"])
 sample_key_rows  = fit_map_df[fit_map_df["sdt_filename"].isin(sample_filenames)]
@@ -645,6 +780,21 @@ else:
 # Needed by Steps 15c, 16, 17, 18 -- define here so all sub-steps can run independently
 sample_df = sdt_df[sdt_df["file_type"] == "sample"].copy()
 
+if REQUIRE_SHIFT_ZERO:
+    def _has_sz_key(fn, ft):
+        k = best_fit_key(fn, ft)
+        return k is not None and "-sz-" in k.lower()
+    _sz_mask = sample_df.apply(
+        lambda r: _has_sz_key(r["filename"], r.get("fixation_type")), axis=1
+    )
+    _n_dropped = (~_sz_mask).sum()
+    if _n_dropped:
+        print(f"REQUIRE_SHIFT_ZERO: dropping {_n_dropped} files with no sz fit key:")
+        for _fn in sample_df.loc[~_sz_mask, "filename"]:
+            print(f"  {_fn}")
+    sample_df = sample_df[_sz_mask].copy()
+    print(f"REQUIRE_SHIFT_ZERO: {len(sample_df)} files remain")
+
 # %% [markdown]
 # ## Step 15c: Chi^2 distribution figure
 #
@@ -802,8 +952,13 @@ for _, row in sample_df.sort_values("acquisition_time").iterrows():
 # using the preferred fit model. Distributions are in picoseconds (ps).
 
 # %%
-tau_pools   = {ft: [] for ft in TAU_BOUNDS}
-ratio_pools = {ft: [] for ft in RATIO_CFG}
+# Pool pixels separately by (fixation_type, shift_group, n_comp) to avoid
+# multimodal distributions caused by mixing shift=0/free fits or 2-comp/3-comp models.
+# Key: (fixation_type, shift_label, n_comp_str)
+tau_pools   = {}
+ratio_pools = {}
+
+_shift_sort_17 = {"shift=0": 0, "shift!=0": 1}
 
 for _, row in sample_df.iterrows():
     fixation_type = row.get("fixation_type")
@@ -816,16 +971,35 @@ for _, row in sample_df.iterrows():
     fd = load_asc_fit_set(fit_dir, base_stem)
     if not fd:
         continue
+
+    # Determine shift group from the shift array (if exported)
+    _shift_arr = fd.get("shift")
+    if _shift_arr is not None and np.count_nonzero(np.nan_to_num(_shift_arr)) > 0:
+        _sl = "shift!=0"
+    else:
+        _sl = "shift=0"
+
+    # Determine n_comp from fit_map_df
+    _fm = fit_map_df[
+        (fit_map_df["sdt_filename"] == row["filename"]) &
+        (fit_map_df["fit_set_key"]  == key)
+    ]
+    _nc = (int(_fm.iloc[0]["n_components"])
+           if not _fm.empty and "n_components" in _fm.columns
+           else None)
+    _nc_str = f"{_nc}-comp" if _nc else "?-comp"
+    _gkey = (fixation_type, _sl, _nc_str)
+
     mask = load_saved_mask(key)
     if mask is None:
         fm = parse_fit_folder(Path(rel_dir).name)
         mask, _ = compute_fit_mask(fd, fixation_type, fm["b_val"])
 
     tau_m = compute_tau_mean(fd, fixation_type)
-    if tau_m is not None and fixation_type in tau_pools:
+    if tau_m is not None:
         vals = tau_m[mask & np.isfinite(tau_m)]
         if vals.size > 0:
-            tau_pools[fixation_type].append(vals)
+            tau_pools.setdefault(_gkey, []).append(vals)
 
     if fixation_type in RATIO_CFG:
         num_p, den_p = RATIO_CFG[fixation_type]
@@ -834,22 +1008,26 @@ for _, row in sample_df.iterrows():
                 ratio = np.where(fd[den_p] > 0, fd[num_p] / fd[den_p], np.nan)
             vals = ratio[mask & np.isfinite(ratio)]
             if vals.size > 0:
-                ratio_pools[fixation_type].append(vals)
+                ratio_pools.setdefault(_gkey, []).append(vals)
 
-fix_types = sorted(set(list(tau_pools) + list(ratio_pools)))
-for ft in fix_types:
-    has_tau   = bool(tau_pools.get(ft))
-    has_ratio = bool(ratio_pools.get(ft))
+# Plot one figure per (fixation_type, shift_group, n_comp) combination.
+all_gkeys = sorted(
+    set(list(tau_pools) + list(ratio_pools)),
+    key=lambda x: (x[0], _shift_sort_17.get(x[1], 9), x[2] or ""),
+)
+for _gkey in all_gkeys:
+    ft, _sl, _nc_str = _gkey
+    has_tau   = _gkey in tau_pools
+    has_ratio = _gkey in ratio_pools
     n_panels  = int(has_tau) + int(has_ratio)
     if n_panels == 0:
-        print(f"  {ft}: no data")
         continue
 
     fig, axes = plt.subplots(1, n_panels, figsize=(5 * n_panels, 4), squeeze=False)
     col = 0
 
     if has_tau:
-        vals = np.concatenate(tau_pools[ft])
+        vals = np.concatenate(tau_pools[_gkey])
         lo   = float(np.percentile(vals[vals > 0], 1)) if (vals > 0).any() else 0.0
         hi   = float(np.percentile(vals, 99))
         axes[0][col].hist(vals, bins=100, range=(lo, hi), density=True,
@@ -857,7 +1035,7 @@ for ft in fix_types:
         axes[0][col].set_xlabel("tau_mean (ps)")
         axes[0][col].set_ylabel("density")
         axes[0][col].set_title(
-            f"{ft}  tau_mean\n"
+            f"{ft} [{_sl}, {_nc_str}]  tau_mean\n"
             f"median={np.median(vals):.0f} ps  "
             f"mean={vals.mean():.0f} ps  "
             f"n={len(vals):,} px"
@@ -866,13 +1044,18 @@ for ft in fix_types:
 
     if has_ratio:
         num_p, den_p = RATIO_CFG[ft]
-        vals = np.concatenate(ratio_pools[ft])
-        axes[0][col].hist(vals, bins=80, range=(0.0, 1.0), density=True,
+        vals = np.concatenate(ratio_pools[_gkey])
+        _fin = vals[np.isfinite(vals)]
+        # Use percentile-based range so glu a2/a3 (typical 1-5) is not clipped.
+        # range=(0.0, 1.0) was wrong for glu where ratio >> 1.
+        _r_lo = float(np.percentile(_fin, 1))  if _fin.size > 0 else 0.0
+        _r_hi = float(np.percentile(_fin, 99)) if _fin.size > 0 else 5.0
+        axes[0][col].hist(vals, bins=80, range=(_r_lo, _r_hi), density=True,
                           color="darkorange", alpha=0.8)
-        axes[0][col].set_xlabel(f"{num_p}/{den_p}")
+        axes[0][col].set_xlabel(f"{num_p}/{den_p}  (raw ratio)")
         axes[0][col].set_ylabel("density")
         axes[0][col].set_title(
-            f"{ft}  amplitude ratio\n"
+            f"{ft} [{_sl}, {_nc_str}]  amplitude ratio\n"
             f"median={np.median(vals):.3f}  "
             f"std={vals.std():.3f}  "
             f"n={len(vals):,} px"
@@ -903,9 +1086,9 @@ for _, row in sample_df.iterrows():
     fd = load_asc_fit_set(fit_dir, base_stem)
     if not fd:
         continue
+    fm = parse_fit_folder(Path(rel_dir).name)   # always parse for n_components
     mask = load_saved_mask(key)
     if mask is None:
-        fm = parse_fit_folder(Path(rel_dir).name)
         mask, _ = compute_fit_mask(fd, fixation_type, fm["b_val"])
 
     n_final = int(mask.sum())
@@ -919,6 +1102,7 @@ for _, row in sample_df.iterrows():
         "em_filter_nm":      row.get("em_filter_nm"),
         "acquisition_time":  row.get("acquisition_time"),
         "fit_set_key":       key,
+        "n_components":      fm.get("n_components"),   # explicit column for downstream filtering
         "n_px_total":        n_total,
         "n_px_final":        n_final,
         "pct_final":         round(100.0 * n_final / n_total, 1) if n_total > 0 else np.nan,
@@ -991,3 +1175,37 @@ print(f"\nSaved: {results_dir / 'fit_analysis_summary.csv'}")
 #     (free ~400 ps, bound ~2500 ps; weighted mean typically 1000-2000 ps)
 #   - For files with both 2-comp and 3-comp fits, compare tau_mean_median_ps
 #     between models using the n_components column in fit_analysis_summary.csv
+
+# %%
+
+# %%
+
+# %%
+
+# %%
+
+# %%
+
+# %%
+
+# %%
+
+# %%
+
+# %%
+
+# %%
+
+# %%
+
+# %%
+
+# %%
+
+# %%
+
+# %%
+
+# %%
+
+# %%

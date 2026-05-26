@@ -3,17 +3,166 @@
 #
 # Reads per-file summary CSVs from Phases D and E; no raw data reloading.
 #
-# Steps:
-# 19. Load and merge Phase D/E summaries; report coverage
-# 20. Photobleaching check: metrics vs acquisition_time within each session
-# 21. Violin plots: tau_mean and amplitude ratio grouped by cell_type
-# 22. Pairwise statistical tests: Mann-Whitney U with Benjamini-Hochberg FDR
-# 23. Phasor vs fit cross-validation: tau_phi vs tau_mean scatter
-# 24. Group summary table -> results/group_summary.csv
+# -----------------------------------------------------------------------
+# Unit of analysis
+# -----------------------------------------------------------------------
+# The unit is one .sdt image file.  Each row in fit_analysis_summary.csv
+# represents one acquired field of view.  The fit metric values reported
+# (tau_mean_median_ps, amp_ratio_median) are the MEDIAN of quality-masked
+# pixels within that image -- not individual pixels.
+#
+# Consequence: statistical tests compare image-level medians, which is
+# appropriate for detecting differences between cell populations but
+# underestimates within-image heterogeneity.
+#
+# -----------------------------------------------------------------------
+# Like-for-like filtering (CRITICAL)
+# -----------------------------------------------------------------------
+# Mixing files fitted with different SPCImage models (2-comp vs 3-comp)
+# or with different IRF-shift modes (shift=0 vs shift!=0) produces
+# bimodal distributions that can wash out or reverse apparent effects.
+#
+# ANALYSIS_N_COMP and ANALYSIS_SHIFT_GROUP (config below) restrict the
+# analysis to a homogeneous subset:
+#   ANALYSIS_N_COMP     -- preferred number of fit components per
+#                          fixation_type.  Files with a different n_comp
+#                          are excluded from df_analysis.
+#   ANALYSIS_SHIFT_GROUP -- "shift=0" | "shift!=0" | None.
+#                          Derived from fit_qc_summary.csv (Phase C).
+#
+# The unfiltered df is retained for diagnostic steps (Steps 19b, 20, 23).
+# ALL group comparisons (Steps 21, 22, 24-27) use df_analysis.
+#
+# -----------------------------------------------------------------------
+# Amplitude ratio definition (WARNING: raw ratio, not fraction)
+# -----------------------------------------------------------------------
+# amp_ratio is the RAW ratio of two SPCImage amplitude components:
+#   glu  : a2 / a3  (free NADH amplitude / bound NADH amplitude)
+#   form : a1 / a2  (free / bound)
+#   live : a1 / a2
+# Values are NOT bounded by [0, 1] -- for glu, typical a2/a3 ~ 1-5.
+# To get the normalised free-NADH fraction use amp_num / (amp_num + amp_den)
+# computed from the per-pixel maps in Phase E.
+# Violin plots and summary tables display the raw ratio.
+#
+# -----------------------------------------------------------------------
+# tau_mean definition
+# -----------------------------------------------------------------------
+# tau_mean is the amplitude-weighted mean lifetime (ps) from Phase E.
+#   glu  : (a2*tau2 + a3*tau3) / (a2+a3)  -- artifact a1/tau1 excluded
+#   form : (a1*tau1 + a2*tau2) / (a1+a2)
+#   live : same as form
+# For glu files fitted with a 2-comp fallback, tau_mean is NaN because
+# the a3/tau3 components are absent.  Such files contribute NaN to
+# tau_mean_median_ps and are silently absent from tau_mean comparisons.
+#
+# -----------------------------------------------------------------------
+# Statistical test
+# -----------------------------------------------------------------------
+# Step 22 uses a two-sided Mann-Whitney U test on per-image medians.
+# All pairwise cell_type combinations per (fixation_type, metric) block
+# are tested together; p-values are corrected with Benjamini-Hochberg FDR.
+# Effect size: rank-biserial r = 1 - 2U/(n1*n2).
+#   |r| < 0.3 small, 0.3-0.5 medium, > 0.5 large.
+#   Positive r: group_a tends to be larger than group_b.
+# Only cell_type groups with >= MIN_N images are included.
+#
+# -----------------------------------------------------------------------
+# IRF drift and calibration sensitivity
+# -----------------------------------------------------------------------
+# The IRF (Instrument Response Function) encodes the timing jitter of the
+# TCSPC detector.  If the IRF peak shifts between sessions or during a
+# session, fitted lifetimes are systematically wrong by an amount that
+# scales with the shift.
+#
+# Phase D (phasor): uses a per-session IRF calibration file measured each
+#   session.  Between-session IRF drift is therefore corrected.  Within-
+#   session drift is not corrected and broadens the phasor cloud.
+#
+# Phase E (reconvolution fitting from SPCImage): this pipeline imports
+#   already-fitted parameters -- it does NOT re-fit or re-calibrate.
+#   Sensitivity to IRF drift depends entirely on which IRF file was used
+#   inside SPCImage:
+#     - If SPCImage used a SINGLE IRF file for all sessions, any session
+#       where the IRF had drifted will have systematically shifted lifetimes.
+#     - If SPCImage used PER-SESSION IRF files, between-session drift is
+#       corrected at the fitting stage.
+#   This pipeline cannot determine which was done.  Confirm with the
+#   SPCImage project files before interpreting inter-session differences.
+#
+# The SPCImage "shift" parameter (shift=0 vs shift!=0) is an in-fitting
+#   correction for IRF timing offset.  shift=0 files absorbed any timing
+#   offset into the lifetime values.  shift!=0 files corrected for it but
+#   introduce a correlated free parameter that can cause bimodal tau
+#   distributions (two local minima for shift vs tau).
+#
+# -----------------------------------------------------------------------
+# Inter-session confounding (CRITICAL WARNING)
+# -----------------------------------------------------------------------
+# Step 19b checks for bimodality by imaging session.  If tau_mean_median_ps
+# separates strongly by session_root, the comparison may be confounded:
+#
+#   Fixed samples (glu, form): fixation time, fixation protocol, and
+#     fixative concentration can vary between sessions.  Different fixation
+#     times alter the fraction of bound vs free NADH independently of
+#     genotype.  If different genotypes were predominantly imaged in
+#     different sessions, session is a confound for genotype.
+#
+#   Live samples: if only one cell type was imaged per session, session
+#     and cell_type are completely confounded and no statistical comparison
+#     is possible without a session-corrected model (e.g., mixed effects).
+#
+# BEFORE interpreting any group differences:
+#   1. Check which sessions each cell type appears in.
+#   2. If there is no within-session replication across genotypes, the
+#      group comparison is not interpretable.
+#   3. If session bimodality is present, consult the experimental log to
+#      determine whether fixation conditions differed.
+#
+# -----------------------------------------------------------------------
+# Known limitations and cautions
+# -----------------------------------------------------------------------
+# 1. Pseudo-replication: pixels within one image are spatially correlated
+#    (SPCImage bins over (2b+1)^2 neighborhoods).  Using per-image medians
+#    avoids this.  But multiple images from the same dish are not fully
+#    independent -- no dish-level random effect is modeled.
+#
+# 2. Asymmetric tau_mean filter in Phase E: live images apply an extra
+#    tau_mean >= 250 ps criterion that glu and form do not.  This may
+#    affect the live distribution shape relative to fixed conditions.
+#
+# 3. Photobleaching: Step 20 checks for metric drift within a session.
+#    If drift is detected, acquisition order should be treated as a
+#    covariate or early/late acquisitions excluded before final analysis.
+#
+# 4. n_components column in fit_analysis_summary.csv: parsed from the fit
+#    folder name string (e.g. "fitet-sf-3component-b5" -> 3).  If the
+#    folder uses an older naming scheme ("c2", "c3") the regex may fail
+#    and n_components will be None.  Check the distribution printout in
+#    Step 19 before interpreting ANALYSIS_N_COMP filtering.
+#
+# 5. ANALYSIS_SHIFT_GROUP is now a per-fixation-type dict.  If all files
+#    of a given fixation_type were fitted with a free shift in SPCImage
+#    (shift!=0), a "shift=0" filter silently excludes all of them.  A
+#    WARNING is printed in Step 19 when this happens.
+#
+# -----------------------------------------------------------------------
+# Steps
+# -----------------------------------------------------------------------
+# 19.  Load and merge Phase D/E summaries; report coverage
+# 19b. Bimodality diagnosis (unfiltered): session, fit model, calibration
+# 20.  Photobleaching check: metrics vs acquisition_time within session
+# 21.  Violin plots: tau_mean and amplitude ratio grouped by cell_type
+# 22.  Pairwise statistical tests: Mann-Whitney U with BH-FDR
+# 23.  Phasor vs fit cross-validation: tau_phi vs tau_mean scatter
+# 24.  Group summary table -> results/group_summary.csv
+# 25.  Per-channel comparison (em_filter_nm facets)
+# 26-27. Additional diagnostic plots
 
 # %%
 from pathlib import Path
 import itertools
+import re
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -47,11 +196,43 @@ PHASOR_METRICS = ["tau_phi_ns", "tau_mod_ns", "G_cal_wmean", "S_cal_wmean"]
 
 METRIC_LABELS = {
     "tau_mean_median_ps": "tau_mean median (ps)",
-    "amp_ratio_median":   "a1/a2 ratio (median)",
+    # glu: a2/(a2+a3) free/bound NADH ratio (artifact component excluded)
+    # form/live: a1/(a1+a2) free/bound NADH ratio
+    "amp_ratio_median":   "amp ratio (median)",
     "tau_phi_ns":         "tau_phi (ns)",
     "tau_mod_ns":         "tau_mod (ns)",
     "G_cal_wmean":        "G_cal (photon-weighted mean)",
     "S_cal_wmean":        "S_cal (photon-weighted mean)",
+}
+
+# Restrict group comparisons to a single fit model so every violin contains
+# only like-for-like measurements.  Mixing n_comp or shift groups produces
+# bimodal distributions that wash out any biological signal.
+#
+# ANALYSIS_N_COMP: preferred n_components per fixation_type.
+#   Files where best_fit_key() resolved to a different n_comp are excluded.
+#   Set a value to None to include all n_comp variants for that fixation_type.
+ANALYSIS_N_COMP = {"glu": 3, "form": 2, "live": 2}
+
+# ANALYSIS_SHIFT_GROUP: per-fixation-type dict.
+#   Value: "shift=0" | "shift!=0" | None (no filter for that type).
+#   Derived from fit_qc_summary.csv (Phase C shift_nonzero_px column).
+#   If fit_qc_summary.csv is absent, all files are treated as "shift=0".
+#
+#   IMPORTANT: if all files of a given fixation_type were fitted with a
+#   free IRF shift in SPCImage (shift!=0), setting that type to "shift=0"
+#   will produce an empty analysis group.  Check the shift breakdown printed
+#   in Step 19 before changing these values.
+#
+#   Typical reasons all live files end up as shift!=0:
+#     - SPCImage was configured with shift=free for the live acquisition set
+#     - The live IRF timing offset was consistently non-zero across sessions
+#   In that case set live to "shift!=0" to retain those files, but note that
+#   the shift parameter correlates with the fitted lifetimes (see header).
+ANALYSIS_SHIFT_GROUP = {
+    "glu":  "shift=0",
+    "form": "shift=0",
+    "live": "shift=0",  # best_fit_key now prefers sz folders; check WARNING in Step 19
 }
 
 # %% [markdown]
@@ -100,14 +281,246 @@ print(f"Combined dataframe: {len(df)} rows")
 print("\nCoverage by fixation_type x cell_type:")
 print(df.groupby(["fixation_type", "cell_type"], dropna=False).size().to_string())
 
+# Session x cell_type cross-tab: printed here as an early confounding check.
+# If each cell type appears ONLY in its own session(s) the comparison is
+# confounded -- any group difference could be a session/batch effect.
+print("\nSession x cell_type (files per cell): check for session/genotype confounding")
+if "session_root" in df.columns and "cell_type" in df.columns:
+    _xtab = (df.groupby(["fixation_type", "session_root", "cell_type"], dropna=False)
+               .size()
+               .unstack("cell_type", fill_value=0))
+    print(_xtab.to_string())
+    _ct_cols = [c for c in CELL_TYPE_ORDER if c in _xtab.columns]
+    for _ft in FIXATION_ORDER:
+        _sub_xt = _xtab[_xtab.index.get_level_values("fixation_type") == _ft][_ct_cols]
+        if _sub_xt.empty:
+            continue
+        # A session is "confounded" if only one cell type has > 0 files in that session
+        _confounded = [idx for idx in _sub_xt.index
+                       if (_sub_xt.loc[idx] > 0).sum() < 2]
+        if _confounded:
+            print(f"  CAUTION [{_ft}]: {len(_confounded)} session(s) have only "
+                  f"one cell type -- session and genotype are partially confounded.")
+
 print("\nMetric availability:")
 all_metrics = [m for m in FIT_METRICS + PHASOR_METRICS if m in df.columns]
 for m in all_metrics:
     print(f"  {m:30s}: {df[m].notna().sum()}/{len(df)}")
 
-# Convenience subsets
-fix_present  = [f for f in FIXATION_ORDER  if f in df["fixation_type"].dropna().unique()]
-ct_present   = [c for c in CELL_TYPE_ORDER if c in df["cell_type"].dropna().unique()]
+# %%
+# -- Parse n_components and shift_group from fit metadata -------------------
+#
+# n_components: Phase E (Step 18) now writes an explicit n_components column
+#   to fit_analysis_summary.csv.  Use it directly when present; fall back to
+#   regex parsing of fit_set_key for older CSV files that lack the column.
+#   Regex rules:
+#     "...fitet-sf-3component-b5..." -> 3
+#     "...fitet-sf-c2-b3..."        -> 2
+#
+# shift_group: merged from fit_qc_summary.csv (Phase C output).
+#   shift_nonzero_px > 0 means SPCImage used a free IRF shift.
+#   If fit_qc_summary.csv is absent, every file is labelled "shift=0".
+
+def _parse_n_comp_from_key(key):
+    if not isinstance(key, str):
+        return np.nan
+    m = re.search(r"[-_](\d+)component", key, re.IGNORECASE)
+    if m:
+        return float(m.group(1))
+    m = re.search(r"[-_]c(\d+)(?=[-_b]|$)", key, re.IGNORECASE)
+    return float(m.group(1)) if m else np.nan
+
+# Prefer the explicit column; fall back to key-string parsing
+if "n_components" not in df.columns or df["n_components"].isna().all():
+    df["n_components"] = df["fit_set_key"].apply(_parse_n_comp_from_key)
+    print("n_components: parsed from fit_set_key string (no explicit column found)")
+else:
+    # Fill any gaps with key-string parsing
+    _missing = df["n_components"].isna()
+    if _missing.any():
+        df.loc[_missing, "n_components"] = (
+            df.loc[_missing, "fit_set_key"].apply(_parse_n_comp_from_key)
+        )
+    print("n_components: using explicit column from fit_analysis_summary.csv")
+
+qc_path = results_dir / "fit_qc_summary.csv"
+if qc_path.exists():
+    _qc = pd.read_csv(qc_path)[["filename", "shift_nonzero_px"]].drop_duplicates("filename")
+    df  = df.merge(_qc, on="filename", how="left")
+    df["shift_group"] = df["shift_nonzero_px"].apply(
+        lambda x: "shift!=0" if (pd.notna(x) and float(x) > 0) else "shift=0"
+    )
+    print(f"\nShift groups merged from fit_qc_summary.csv:")
+    print(df.groupby(["fixation_type", "shift_group"], dropna=False).size().to_string())
+else:
+    df["shift_group"] = "shift=0"
+    print("\nfit_qc_summary.csv not found; all files treated as shift=0")
+
+print("\nn_components distribution:")
+print(df.groupby(["fixation_type", "n_components"], dropna=False).size().to_string())
+
+# %%
+# -- Filter to like-for-like analysis subset --------------------------------
+#
+# Drop files that don't match ANALYSIS_N_COMP or ANALYSIS_SHIFT_GROUP so that
+# violins and statistical tests compare only homogeneous fit populations.
+# Stored as df_analysis; the raw df is kept for diagnostics (Steps 19b, 20, 23).
+
+df_analysis = df.copy()
+
+if ANALYSIS_N_COMP:
+    for fix_type, preferred_nc in ANALYSIS_N_COMP.items():
+        if preferred_nc is None:
+            continue
+        mask_ok = (
+            (df_analysis["fixation_type"] != fix_type) |
+            df_analysis["n_components"].isna() |
+            (df_analysis["n_components"] == preferred_nc)
+        )
+        n_drop = (~mask_ok).sum()
+        if n_drop > 0:
+            print(f"  n_comp filter: dropped {n_drop} {fix_type} rows"
+                  f" not matching {preferred_nc}-comp")
+        df_analysis = df_analysis[mask_ok]
+
+if isinstance(ANALYSIS_SHIFT_GROUP, dict):
+    # Per-fixation-type shift filter
+    for fix_type, sg_val in ANALYSIS_SHIFT_GROUP.items():
+        if sg_val is None:
+            continue
+        mask_shift = (
+            (df_analysis["fixation_type"] != fix_type) |
+            df_analysis["shift_group"].isna() |
+            (df_analysis["shift_group"] == sg_val)
+        )
+        n_drop = (~mask_shift).sum()
+        if n_drop > 0:
+            print(f"  shift filter [{fix_type}]: dropped {n_drop} rows"
+                  f" not in '{sg_val}'")
+        df_analysis = df_analysis[mask_shift]
+elif ANALYSIS_SHIFT_GROUP is not None:
+    # Global shift filter (legacy scalar)
+    mask_shift = (
+        df_analysis["shift_group"].isna() |
+        (df_analysis["shift_group"] == ANALYSIS_SHIFT_GROUP)
+    )
+    n_drop = (~mask_shift).sum()
+    if n_drop > 0:
+        print(f"  shift filter: dropped {n_drop} rows not in '{ANALYSIS_SHIFT_GROUP}'")
+    df_analysis = df_analysis[mask_shift]
+
+print(f"\nAnalysis dataset: {len(df_analysis)} rows  "
+      f"(from {len(df)} total; "
+      f"n_comp={ANALYSIS_N_COMP}, shift={ANALYSIS_SHIFT_GROUP})")
+print(df_analysis.groupby(["fixation_type", "cell_type"], dropna=False).size().to_string())
+
+# Warn loudly if any fixation_type is completely absent after filtering
+for _ft in FIXATION_ORDER:
+    _n_ft = (df_analysis["fixation_type"] == _ft).sum()
+    _n_before = (df["fixation_type"] == _ft).sum()
+    if _n_before > 0 and _n_ft == 0:
+        print(f"\n  WARNING: {_ft} has 0 rows in df_analysis (was {_n_before} before filtering).")
+        print(f"    Check ANALYSIS_N_COMP['{_ft}'] and ANALYSIS_SHIFT_GROUP['{_ft}'].")
+        _ft_sg = df[df["fixation_type"] == _ft]["shift_group"].value_counts()
+        _ft_nc = df[df["fixation_type"] == _ft]["n_components"].value_counts()
+        print(f"    shift_group distribution:\n{_ft_sg.to_string()}")
+        print(f"    n_components distribution:\n{_ft_nc.to_string()}")
+
+# Convenience subsets derived from the filtered dataset
+fix_present = [f for f in FIXATION_ORDER  if f in df_analysis["fixation_type"].dropna().unique()]
+ct_present  = [c for c in CELL_TYPE_ORDER if c in df_analysis["cell_type"].dropna().unique()]
+
+# %%
+# -- Step 19b: Bimodality diagnosis -----------------------------------------
+#
+# Before group comparison, test the three hypotheses for bimodal distributions:
+#   (A) Imaging day    -- color by session_root
+#   (B) Fit model mix  -- color by n_components or shift_group
+#   (C) Calibration    -- compare phasor tau_phi with fit tau_mean; if both
+#       are bimodal and modes map to sessions, suspect calibration drift.
+#
+# Uses the UNFILTERED df so session/model mixing is visible before filtering.
+
+_diag_metric = "tau_mean_median_ps"
+if _diag_metric in df.columns and df[_diag_metric].notna().any():
+    _sessions  = sorted(df["session_root"].dropna().unique())
+    _n_comps   = sorted(df["n_components"].dropna().unique())
+    _sgroups   = sorted(df["shift_group"].dropna().unique())
+    _s_cmap    = plt.cm.tab10(np.linspace(0, 0.9, max(len(_sessions), 1)))
+    _nc_cmap   = plt.cm.Set1(np.linspace(0, 0.8, max(len(_n_comps), 1)))
+    _sg_colors = {"shift=0": "steelblue", "shift!=0": "darkorange"}
+
+    for _ft in [f for f in FIXATION_ORDER if f in df["fixation_type"].dropna().unique()]:
+        _sub = df[(df["fixation_type"] == _ft) & df[_diag_metric].notna()]
+        if _sub.empty:
+            continue
+        _vals_all = _sub[_diag_metric].values
+        _lo = float(np.percentile(_vals_all, 1))
+        _hi = float(np.percentile(_vals_all, 99))
+        _bins = np.linspace(_lo, _hi, 60)
+
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+        # (A) By imaging session
+        for i, sess in enumerate(_sessions):
+            v = _sub[_sub["session_root"] == sess][_diag_metric].values
+            if v.size > 0:
+                axes[0].hist(v, bins=_bins, alpha=0.55, density=True,
+                             color=_s_cmap[i], label=sess[:20])
+        axes[0].set_title(f"(A) By imaging session\n{_ft}")
+        axes[0].set_xlabel(_diag_metric)
+        axes[0].legend(fontsize=6, loc="upper right")
+
+        # (B) By fit model (n_comp and shift_group)
+        for nc in _n_comps:
+            v = _sub[_sub["n_components"] == nc][_diag_metric].values
+            if v.size > 0:
+                nc_idx = list(_n_comps).index(nc)
+                axes[1].hist(v, bins=_bins, alpha=0.55, density=True,
+                             color=_nc_cmap[nc_idx], label=f"{int(nc)}-comp")
+        for sg in _sgroups:
+            v = _sub[_sub["shift_group"] == sg][_diag_metric].values
+            if v.size > 0:
+                axes[1].hist(v, bins=_bins, alpha=0.35, density=True,
+                             color=_sg_colors.get(sg, "gray"),
+                             linestyle="--", histtype="step",
+                             linewidth=1.5, label=sg)
+        axes[1].set_title(f"(B) By fit model\n{_ft}")
+        axes[1].set_xlabel(_diag_metric)
+        axes[1].legend(fontsize=7, loc="upper right")
+
+        # (C) Phasor vs fit: if phasor tau_phi is also bimodal,
+        #     and modes map to sessions, it is a calibration issue.
+        if "tau_phi_ns" in _sub.columns and _sub["tau_phi_ns"].notna().any():
+            _phi_vals = _sub["tau_phi_ns"].dropna().values * 1000  # ns -> ps equivalent
+            _phi_lo   = float(np.percentile(_phi_vals, 1))
+            _phi_hi   = float(np.percentile(_phi_vals, 99))
+            for i, sess in enumerate(_sessions):
+                v = _sub[_sub["session_root"] == sess]["tau_phi_ns"].dropna().values * 1000
+                if v.size > 0:
+                    axes[2].hist(v, bins=np.linspace(_phi_lo, _phi_hi, 60),
+                                 alpha=0.55, density=True,
+                                 color=_s_cmap[i], label=sess[:20])
+            axes[2].set_title(f"(C) Phasor tau_phi (session colored)\n{_ft}")
+            axes[2].set_xlabel("tau_phi (ps equiv.)")
+            axes[2].legend(fontsize=6, loc="upper right")
+        else:
+            axes[2].text(0.5, 0.5, "tau_phi not available\n(run Phase D first)",
+                         ha="center", va="center", transform=axes[2].transAxes,
+                         fontsize=10, color="gray")
+            axes[2].set_title(f"(C) Phasor tau_phi\n{_ft}")
+
+        fig.suptitle(
+            f"Bimodality diagnosis -- {_ft}  "
+            f"(unfiltered n={len(_sub)})\n"
+            "Mode aligns with (A)=imaging day, (B)=fit model, (C)=calibration",
+            fontsize=9,
+        )
+        plt.tight_layout()
+        _savefig(fig, f"fig_bimodality_diag_{_ft}")
+        plt.show()
+else:
+    print("tau_mean_median_ps not available -- run Phase E first.")
 
 # %% [markdown]
 # ## Step 20: Photobleaching check
@@ -177,11 +590,13 @@ for metric in all_metrics:
                              squeeze=False)
 
     for ax, fix_type in zip(axes[0], fix_present):
-        sub = (df[(df["fixation_type"] == fix_type) &
-                  df["cell_type"].isin(ct_present)]
+        sub = (df_analysis[(df_analysis["fixation_type"] == fix_type) &
+                           df_analysis["cell_type"].isin(ct_present)]
                .dropna(subset=[metric]))
 
-        cts_here  = [ct for ct in ct_present if (sub["cell_type"] == ct).any()]
+        # Require >= 2 non-NaN values per group: violinplot KDE fails with n < 2.
+        # sub is already dropna'd on metric above, so .sum() counts non-NaN rows.
+        cts_here  = [ct for ct in ct_present if (sub["cell_type"] == ct).sum() >= 2]
         groups    = [sub[sub["cell_type"] == ct][metric].values for ct in cts_here]
         colors    = [ct_color[ct] for ct in cts_here]
 
@@ -256,12 +671,12 @@ def rank_biserial_r(x: np.ndarray, y: np.ndarray) -> float:
 stat_rows = []
 
 for fix_type in fix_present:
-    sub  = df[df["fixation_type"] == fix_type]
+    sub  = df_analysis[df_analysis["fixation_type"] == fix_type]
+    # Include a cell type if it has >= MIN_N total rows in df_analysis for this
+    # fixation_type.  Per-metric NaN filtering is handled inside the metric loop
+    # by the `if len(x) < MIN_N or len(y) < MIN_N: continue` guard.
     cts  = [ct for ct in ct_present
-            if len(sub[sub["cell_type"] == ct].dropna(subset=["tau_mean_median_ps"]
-                                                       if "tau_mean_median_ps" in df.columns
-                                                       else [])) >= MIN_N
-            or len(sub[sub["cell_type"] == ct]) >= MIN_N]
+            if len(sub[sub["cell_type"] == ct]) >= MIN_N]
     if len(cts) < 2:
         continue
     pairs = list(itertools.combinations(cts, 2))
@@ -329,8 +744,8 @@ if not stat_df.empty:
                 (stat_df["fixation_type"] == fix_type)
             ]
             cts = [ct for ct in ct_present
-                   if len(df[(df["fixation_type"] == fix_type) &
-                             (df["cell_type"] == ct)]) >= MIN_N]
+                   if len(df_analysis[(df_analysis["fixation_type"] == fix_type) &
+                                      (df_analysis["cell_type"] == ct)]) >= MIN_N]
             n   = len(cts)
             if n < 2:
                 ax.set_visible(False)
@@ -429,7 +844,8 @@ for y_col, x_col in xval_pairs:
 summary_rows = []
 for fix_type in fix_present:
     for ct in ct_present:
-        sub = df[(df["fixation_type"] == fix_type) & (df["cell_type"] == ct)]
+        sub = df_analysis[(df_analysis["fixation_type"] == fix_type) &
+                          (df_analysis["cell_type"] == ct)]
         if sub.empty:
             continue
         rec = {"fixation_type": fix_type, "cell_type": ct, "n_files": len(sub)}
@@ -475,7 +891,7 @@ print(f"Saved: {results_dir / 'group_summary.csv'}")
 CHANNEL_METRICS = [m for m in ["amp_ratio_median", "tau_mean_median_ps"]
                    if m in df.columns]
 
-channels = sorted(df["em_filter_nm"].dropna().unique())
+channels = sorted(df_analysis["em_filter_nm"].dropna().unique())
 
 if len(channels) < 2:
     print("Only one emission channel in data -- skipping per-channel comparison.")
@@ -499,10 +915,10 @@ else:
             all_vals_by_ch = {}   # ch -> pooled values for channel-level significance
 
             for ci, ch in enumerate(channels):
-                sub = (df[(df["fixation_type"] == fix_type) &
-                          (df["em_filter_nm"]  == ch) &
-                          df["cell_type"].isin(ct_present)]
-                       .dropna(subset=[metric]))
+                sub = (df_analysis[(df_analysis["fixation_type"] == fix_type) &
+                                   (df_analysis["em_filter_nm"]  == ch) &
+                                   df_analysis["cell_type"].isin(ct_present)]
+                                  .dropna(subset=[metric]))
                 cts_here = [ct for ct in ct_present
                             if (sub["cell_type"] == ct).any()]
                 all_vals_by_ch[ch] = sub[metric].values
@@ -596,9 +1012,9 @@ else:
                                  figsize=(4 * len(fix_present), 5),
                                  squeeze=False)
         for ax, fix_type in zip(axes[0], fix_present):
-            sub = (df[(df["fixation_type"] == fix_type) &
-                      df["cell_type"].isin(ct_present)]
-                   .dropna(subset=[cv_col]))
+            sub = (df_analysis[(df_analysis["fixation_type"] == fix_type) &
+                               df_analysis["cell_type"].isin(ct_present)]
+                              .dropna(subset=[cv_col]))
             cts_here = [ct for ct in ct_present
                         if (sub["cell_type"] == ct).any()]
             groups   = [sub[sub["cell_type"] == ct][cv_col].values
@@ -638,7 +1054,7 @@ else:
 # slide and to flag underpowered groups before interpreting statistics.
 
 # %%
-size_tbl = (df[df["cell_type"].isin(ct_present)]
+size_tbl = (df_analysis[df_analysis["cell_type"].isin(ct_present)]
             .groupby(["fixation_type", "cell_type", "em_filter_nm"],
                      dropna=False)
             .size()

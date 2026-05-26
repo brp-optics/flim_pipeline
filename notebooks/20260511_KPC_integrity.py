@@ -15,6 +15,7 @@ import pandas as pd
 import re
 import matplotlib.pyplot as plt
 from sdtfile import SdtFile
+from scipy.ndimage import uniform_filter as _uniform_filter
 
 # -- Configuration ----------------------------------------------------------
 WIN_DATA_DIRS = [
@@ -73,6 +74,13 @@ LOAD_WORKERS = 8
 # representing free NADH.  Used in Step 7 to flag unrealistic pixels.
 TAU1_REALISM_PS = 200.0
 
+# Minimum binned-photon count for the tau1 realism pixel gate.
+# Pixels below this are excluded before computing the tau1 fraction,
+# removing background pixels where the fit is poorly constrained.
+# Match these values to Phase E MIN_PHOTONS_BY_NCOMP thresholds.
+MIN_PHOTONS_BY_NCOMP = {2: 200, 3: 100}
+MIN_PHOTONS_DEFAULT  = 200   # used when n_components is unknown
+
 # %%
 # -- Load Phase B outputs ---------------------------------------------------
 results_dir = Path("../results")
@@ -127,6 +135,13 @@ def _infer_param_name(stem: str) -> str:
             return name
     parts = s.rsplit("_", 1)
     return parts[-1] if len(parts) > 1 else s
+
+
+def _parse_bin_param(folder: str) -> int:
+    """Extract SPCImage bin parameter b from fit folder name.
+    e.g. 'fitet-sf-c2-b3' -> 3.  Returns 0 if not found (no smoothing)."""
+    m = re.search(r"-b(\d+)", str(folder), re.IGNORECASE)
+    return int(m.group(1)) if m else 0
 
 
 def _strip_param_suffix(stem: str) -> str:
@@ -236,11 +251,28 @@ for _sample_key in list(fit_data.keys())[:3]:
     print(f"    params: {_plist}")
 
 # Helper: select best fit_set_key for a file using fit_map_df + PREFERRED_N_COMP
+def _prefer_shift_zero(candidates) -> str:
+    """Among candidate rows, return the fit_set_key of the shift-zero folder.
+
+    Prefers rows whose key contains '-sz-' (SPCImage shift=zero) over '-sf-'
+    (shift=free).  Falls back to the first row if no '-sz-' match exists.
+
+    This matters when a file has BOTH a shift-zero and a shift-free fit of the
+    same n_components: best_fit_key must consistently pick one so that
+    shift_nonzero_px is computed on the correct folder.
+    """
+    sz_rows = candidates[candidates["fit_set_key"].str.contains("-sz-", case=False, na=False)]
+    chosen  = sz_rows if not sz_rows.empty else candidates
+    return str(chosen.iloc[0]["fit_set_key"])
+
+
 def best_fit_key(filename: str, fixation_type: str = None) -> str | None:
     """Return the preferred fit_set_key for a file.
 
-    Selects by PREFERRED_N_COMP[fixation_type] when available.
-    Falls back to the key with the highest n_components.
+    Selection priority:
+      1. Match PREFERRED_N_COMP[fixation_type]; among ties prefer shift-zero folder.
+      2. Else: highest n_components; among ties prefer shift-zero folder.
+      3. Else: first row.
     """
     rows = fit_map_df[fit_map_df["sdt_filename"] == filename]
     if rows.empty:
@@ -249,11 +281,12 @@ def best_fit_key(filename: str, fixation_type: str = None) -> str | None:
     if preferred is not None and "n_components" in rows.columns:
         exact = rows[rows["n_components"] == preferred]
         if not exact.empty:
-            return str(exact.iloc[0]["fit_set_key"])
-    col = "n_components" if "n_components" in rows.columns else None
-    if col:
-        return str(rows.sort_values(col, ascending=False).iloc[0]["fit_set_key"])
-    return str(rows.iloc[0]["fit_set_key"])
+            return _prefer_shift_zero(exact)
+    if "n_components" in rows.columns:
+        best_nc = rows["n_components"].max()
+        top     = rows[rows["n_components"] == best_nc]
+        return _prefer_shift_zero(top)
+    return _prefer_shift_zero(rows)
 
 
 # Convenience: apply orientation correction to a fit array
@@ -404,45 +437,77 @@ if not shift_meta_df.empty:
 # component is absorbing the fixation artifact rather than free NADH.
 # Results are merged into fit_qc_summary.csv and plotted in Step 10.
 tau1_realism_rows = []
+_tau1_n_no_photons = 0
+
 for _, row in sample_fits.iterrows():
     fn  = row["filename"]
     fix = row.get("fixation_type")
     key = best_fit_key(fn, fix)
     rec = {
-        "filename":              fn,
-        "fixation_type":         fix,
-        "tau1_n_valid":          0,
-        "tau1_frac_lt_thresh":   np.nan,
-        "tau1_median_ps":        np.nan,
+        "filename":            fn,
+        "fixation_type":       fix,
+        "tau1_n_valid":        0,
+        "tau1_frac_lt_thresh": np.nan,
+        "tau1_median_ps":      np.nan,
+        "tau1_min_photons":    np.nan,
     }
     if key and key in fit_data:
         fd = fit_data[key]
-        if "tau1" in fd:
-            arr   = fd["tau1"]
-            valid = np.isfinite(arr) & (arr > 0)
-            n     = int(valid.sum())
-            if n > 0:
-                vals = arr[valid]
-                rec["tau1_n_valid"]        = n
-                rec["tau1_frac_lt_thresh"] = float((vals < TAU1_REALISM_PS).mean())
-                rec["tau1_median_ps"]      = float(np.median(vals))
+        # Only compute when both tau1 and photons are exported.
+        if "tau1" not in fd or "photons" not in fd:
+            if "tau1" in fd:
+                _tau1_n_no_photons += 1
+            tau1_realism_rows.append(rec)
+            continue
+
+        # Look up n_components to choose the photon threshold.
+        _fm = fit_map_df[
+            (fit_map_df["sdt_filename"] == fn) &
+            (fit_map_df["fit_set_key"]  == key)
+        ]
+        n_comp = (int(_fm.iloc[0]["n_components"])
+                  if not _fm.empty and "n_components" in _fm.columns
+                  else None)
+        min_ph = MIN_PHOTONS_BY_NCOMP.get(n_comp, MIN_PHOTONS_DEFAULT)
+        rec["tau1_min_photons"] = float(min_ph)
+
+        # Apply the same spatial binning SPCImage used (kernel 2b+1 square).
+        b      = _parse_bin_param(fd.get("_folder", ""))
+        ph_raw = fd["photons"].astype(float)
+        ph_bin = (_uniform_filter(ph_raw, size=(2 * b + 1)) if b > 0 else ph_raw)
+
+        tau1_arr = fd["tau1"]
+        valid = (np.isfinite(tau1_arr) & (tau1_arr > 0) &
+                 np.isfinite(ph_bin)   & (ph_bin >= min_ph))
+        n = int(valid.sum())
+        if n > 0:
+            vals = tau1_arr[valid]
+            rec["tau1_n_valid"]        = n
+            rec["tau1_frac_lt_thresh"] = float((vals < TAU1_REALISM_PS).mean())
+            rec["tau1_median_ps"]      = float(np.median(vals))
     tau1_realism_rows.append(rec)
 
 tau1_df = pd.DataFrame(tau1_realism_rows)
-# Merge shift group label for printing
 tau1_df["shift_group"] = tau1_df["filename"].apply(
     lambda fn: "shift!=0" if fn in shift_nonzero_files else "shift=0"
 )
 
-print(f"\nTau1 realism check  (threshold = {TAU1_REALISM_PS} ps):")
-print(tau1_df.groupby(["fixation_type", "shift_group"])[
-    ["tau1_frac_lt_thresh", "tau1_median_ps"]
-].mean().round(3).to_string())
+_n_gated = int((tau1_df["tau1_n_valid"] > 0).sum())
+print(f"\nTau1 realism check  (threshold = {TAU1_REALISM_PS} ps, binned photon gate):")
+print(f"  Files computed (photons available): {_n_gated} / {len(tau1_df)}")
+if _tau1_n_no_photons:
+    print(f"  Files skipped (tau1 present but no photons export): {_tau1_n_no_photons}")
+_sub = tau1_df[tau1_df["tau1_n_valid"] > 0]
+if not _sub.empty:
+    print(_sub.groupby(["fixation_type", "shift_group"])[
+        ["tau1_frac_lt_thresh", "tau1_median_ps", "tau1_min_photons"]
+    ].mean().round(3).to_string())
 high = tau1_df[tau1_df["tau1_frac_lt_thresh"] > 0.3]
 if not high.empty:
     print(f"\n  {len(high)} file(s) with >30% pixels below threshold:")
     print(high[["filename", "fixation_type", "shift_group",
-                "tau1_frac_lt_thresh", "tau1_median_ps"]].to_string())
+                "tau1_frac_lt_thresh", "tau1_median_ps",
+                "tau1_min_photons"]].to_string())
 
 # %% [markdown]
 # ## Step 8: Orientation verification
@@ -617,35 +682,56 @@ for ft in fix_types:
 #   form/live: component 1 = shorter NADH, component 2 = longer NADH
 
 # %%
+# Step 10: one figure per (fixation_type, shift_group, n_components) combination.
+# Splitting by n_comp prevents bimodal/trimodal distributions caused by mixing
+# 2-comp and 3-comp fits (tau1 role differs: free NADH vs artifact absorber).
+_shift_sort = {"shift=0": 0, "shift!=0": 1}
+
 for fix_type in ["glu", "form", "live"]:
     all_rows = sample_fits[sample_fits["fixation_type"] == fix_type]
     if all_rows.empty:
         continue
 
-    params_show = (["tau1", "tau2", "tau3", "a1", "a2", "a3", "chi2"]
-                   if fix_type == "glu"
-                   else ["tau1", "tau2", "a1", "a2", "chi2"])
+    # Index files by (shift_label, n_comp) so each combination gets its own figure.
+    # Store (row, fit_set_key) pairs to avoid calling best_fit_key() twice.
+    _groups: dict = {}  # (shift_label, n_comp) -> list of (row, key)
+    for _, row in all_rows.iterrows():
+        fn  = row["filename"]
+        fix = row.get("fixation_type")
+        key = best_fit_key(fn, fix)
+        if key is None or key not in fit_data:
+            continue
+        _sl = "shift!=0" if fn in shift_nonzero_files else "shift=0"
+        _fm = fit_map_df[
+            (fit_map_df["sdt_filename"] == fn) &
+            (fit_map_df["fit_set_key"]  == key)
+        ]
+        _nc = (int(_fm.iloc[0]["n_components"])
+               if not _fm.empty and "n_components" in _fm.columns
+               else None)
+        _gkey = (_sl, _nc)
+        _groups.setdefault(_gkey, []).append((row, key))
 
-    # Split into shift=0 and shift-free subgroups; only add a group if non-empty.
-    shift_groups = []
-    _r0  = all_rows[~all_rows["filename"].isin(shift_nonzero_files)]
-    _rnz = all_rows[ all_rows["filename"].isin(shift_nonzero_files)]
-    if not _r0.empty:
-        shift_groups.append(("shift=0",  _r0))
-    if not _rnz.empty:
-        shift_groups.append(("shift!=0", _rnz))
+    # Iterate in order: shift=0 before shift!=0, lower n_comp first.
+    for (_sl, _nc) in sorted(_groups, key=lambda x: (_shift_sort.get(x[0], 9), x[1] or 0)):
+        _entries = _groups[(_sl, _nc)]
+        _nc_str  = f"{_nc}-comp" if _nc else "?-comp"
 
-    for shift_label, rows in shift_groups:
+        # For 2-comp glu fits tau3/a3 are absent; trim params_show accordingly.
+        if fix_type == "glu" and _nc != 2:
+            params_show = ["tau1", "tau2", "tau3", "a1", "a2", "a3", "chi2"]
+        elif fix_type == "glu":
+            params_show = ["tau1", "tau2", "a1", "a2", "chi2"]
+        else:
+            params_show = ["tau1", "tau2", "a1", "a2", "chi2"]
+
         fig, axes = plt.subplots(1, len(params_show),
                                  figsize=(3 * len(params_show), 3), squeeze=False)
 
         for ax, param in zip(axes[0], params_show):
             arrays = []
-            for _, row in rows.iterrows():
-                key = best_fit_key(row["filename"], row.get("fixation_type"))
-                if key is None or key not in fit_data:
-                    continue
-                fd = fit_data[key]
+            for _row, _key in _entries:
+                fd = fit_data[_key]
                 if param not in fd:
                     continue
                 arr = apply_orientation(fd[param], ORIENTATION_TRANSFORM).ravel()
@@ -663,6 +749,8 @@ for fix_type in ["glu", "form", "live"]:
             else:
                 lo = float(np.percentile(vals[vals > 0], 1)) if (vals > 0).any() else 0
                 hi = float(np.percentile(vals, 99))
+                if hi <= lo:
+                    hi = lo + 1.0   # constant array (e.g. all-zero shift map)
 
             ax.hist(vals, bins=80, range=(lo, hi), density=True,
                     color="steelblue", alpha=0.8)
@@ -670,7 +758,8 @@ for fix_type in ["glu", "form", "live"]:
             ax.set_title(f"{param}\nmedian={np.nanmedian(vals):.4g}")
 
         fig.suptitle(
-            f"Fit parameters -- {fix_type}  ({len(rows)} files)  [{shift_label}]",
+            f"Fit parameters -- {fix_type}  ({len(_entries)} files)"
+            f"  [{_sl}, {_nc_str}]",
             fontsize=10,
         )
         plt.tight_layout()
@@ -795,7 +884,8 @@ if "shift_meta_df" in dir() and not shift_meta_df.empty:
         on="filename", how="left",
     )
 
-_tau1_cols = ["filename", "tau1_n_valid", "tau1_frac_lt_thresh", "tau1_median_ps"]
+_tau1_cols = ["filename", "tau1_n_valid", "tau1_frac_lt_thresh",
+              "tau1_median_ps", "tau1_min_photons"]
 if "tau1_df" in dir() and not tau1_df.empty:
     _qc = _qc.merge(
         tau1_df[[c for c in _tau1_cols if c in tau1_df.columns]],
@@ -1034,10 +1124,12 @@ else:
 #              chi2_mean, chi2_median, frac_hi,
 #              fit_set_key, has_shift_export, shift_nonzero_px,
 #                shift_max_abs_ps, shift_mean_ps, shift_std_ps,
-#              tau1_n_valid, tau1_frac_lt_thresh, tau1_median_ps
+#              tau1_n_valid, tau1_frac_lt_thresh, tau1_median_ps, tau1_min_photons
 #   results/position_annotation.csv  -- fill annotation column before Phase D
 #
 # Before Phase D:
 #   1. Fill in position_annotation.csv (single_cell / colony_deep / colony_edge /
 #      colony_island / no_cells / other)
 #   2. Thresholding (intensity mask per image) is Step 9 of Phase D
+
+# %%

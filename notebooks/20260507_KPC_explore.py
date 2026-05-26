@@ -726,24 +726,21 @@ def _strip_param_suffix(stem: str) -> str:
 
 
 # %%
-print(f"Loading {len(asc_files)} .asc fit export files...")
+print(f"Indexing {len(asc_files)} .asc fit export files (metadata only, no array loading)...")
 
 # fit_data key: "{session_root}::{rel_dir}::{base_stem}"
-# This keeps different fit folders (1-comp, 2-comp, 3-comp) as separate entries
-# even when the base stem is identical.
+# Values: param_name -> Path  (arrays are loaded on-demand by get_fit_arrays / diagnostic)
+# Loading full arrays here is unnecessary for building fit_map.csv and would consume
+# tens of GB of RAM, causing heavy swapping during match_fits_to_sdt.
 fit_data: dict[str, dict] = {}
-parse_failures = []
+n_stat_skipped = 0
 
 for _, row in asc_files.iterrows():
-    # Skip SPCImage summary/statistics files -- they are text tables, not pixel grids
     if re.search(r"_statistic", row["stem"], re.IGNORECASE):
+        n_stat_skipped += 1
         continue
 
-    result = load_spcimage_asc(row["filepath"])
-    if result is None:
-        parse_failures.append(row["filename"])
-        continue
-
+    param_name  = _infer_param_name(row["stem"])
     base        = _strip_param_suffix(row["stem"])
     fit_set_key = f"{row['session_root']}::{row['rel_dir']}::{base}"
 
@@ -753,15 +750,10 @@ for _, row in asc_files.iterrows():
             "_folder":       row["rel_dir"],
             "_base_stem":    base,
         }
-    fit_data[fit_set_key][result["param_name"]]           = result["data"]
-    fit_data[fit_set_key][f"_path_{result['param_name']}"] = result["filepath"]
+    # Store path as value; arrays loaded on-demand only when needed.
+    fit_data[fit_set_key][param_name] = row["filepath"]
 
-n_stat_skipped = sum(1 for _, r in asc_files.iterrows()
-                     if re.search(r"_statistic", r["stem"], re.IGNORECASE))
-print(f"Grouped into {len(fit_data)} fit sets  "
-      f"({n_stat_skipped} statistics files skipped, {len(parse_failures)} parse failures)")
-if parse_failures:
-    print(f"  Failed: {parse_failures[:5]}")
+print(f"Indexed {len(fit_data)} fit sets  ({n_stat_skipped} statistics files skipped)")
 
 print("\nFirst few fit sets:")
 for key, params in list(fit_data.items())[:8]:
@@ -905,25 +897,29 @@ intensity = decay.sum(axis=2)
 print(f"  Intensity:    shape={intensity.shape}, "
       f"min={intensity.min()}, max={intensity.max()}, mean={intensity.mean():.1f}")
 
-# Check fit export shape match
+# Check fit export shape match (loads arrays on-demand for the single test file only)
 if test_row["has_fit_export"]:
     base = test_row["fit_base_stem"]
     param_names = sorted(k for k in fit_data[base] if not k.startswith("_"))
     print(f"\n  Fit params: {param_names}")
 
     for name in param_names:
-        arr = fit_data[base][name]
+        _fp = fit_data[base][name]   # stored as Path
+        try:
+            arr = np.loadtxt(str(_fp), dtype=float)
+        except Exception:
+            print(f"    {name:10s}: (could not load {_fp.name})")
+            continue
         print(f"    {name:10s}: shape={arr.shape}, range=[{np.nanmin(arr):.3g}, {np.nanmax(arr):.3g}]")
 
-    # Shape match check
-    if "photons" in fit_data[base]:
-        fit_shape = fit_data[base]["photons"].shape
-        sdt_shape = intensity.shape
-        if fit_shape == sdt_shape:
-            print(f"\n  Shape match: SDT {sdt_shape} == export {fit_shape}")
-        else:
-            print(f"\n  *** SHAPE MISMATCH: SDT {sdt_shape} vs export {fit_shape} ***")
-            print(f"      Check for flip/transpose -- pipeline step 7")
+        # Shape match check (once, using photons or first available param)
+        if name == "photons" or (name == param_names[0] and "photons" not in param_names):
+            sdt_shape = intensity.shape
+            if arr.shape == sdt_shape:
+                print(f"\n  Shape match: SDT {sdt_shape} == export {arr.shape}")
+            else:
+                print(f"\n  *** SHAPE MISMATCH: SDT {sdt_shape} vs export {arr.shape} ***")
+                print(f"      Check for flip/transpose -- pipeline step 7")
 
 # %% [markdown]
 # ## Convenience functions for downstream notebooks
@@ -956,13 +952,22 @@ def get_fit_arrays(row: pd.Series,
 
     fit_set_key: specific key from fit_map_df; defaults to fit_base_stem (first match).
     Use fit_map_df to enumerate all available fit sets for a file.
+    Arrays are loaded from disk on-demand (fit_data stores paths, not arrays).
     """
     if not row.get("has_fit_export"):
         return None
     key = fit_set_key or row.get("fit_base_stem")
     if not isinstance(key, str) or key not in fit_data:
         return None
-    return {k: v for k, v in fit_data[key].items() if not k.startswith("_")}
+    out = {}
+    for k, v in fit_data[key].items():
+        if k.startswith("_"):
+            continue
+        try:
+            out[k] = np.loadtxt(str(v), dtype=float)
+        except Exception:
+            pass
+    return out if out else None
 
 
 def get_row(df: pd.DataFrame, filename: str = None, idx: int = None) -> pd.Series:

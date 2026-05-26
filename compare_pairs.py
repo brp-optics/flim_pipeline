@@ -50,14 +50,20 @@ RESULTS_DIR = Path("results")
 OUT_DIR = Path("results/figures/pairs")
 
 N_PAIRS_PER_GROUP = 6        # max matched pairs shown per (fixation x channel) group
-TAU_CLIM_PS = (400, 1400)    # shared tau_mean colorscale
+TAU_CLIM_PS = (200, 2500)    # shared tau_mean colorscale; brackets form/live (~800-1600) and glu
+
+# If True, only files whose best_fit_key resolves to a shift-zero (sz) folder
+# are included.  Files with only shift-free (sf) fits are dropped with a warning.
+# Set False to fall back to any available fit when no sz folder exists.
+REQUIRE_SHIFT_ZERO = True
 PHASOR_TAU_LABELS_NS = [1, 2, 3, 4, 5, 6, 7, 8]
 REP_RATE_HZ = 80e6
 OMEGA = 2 * np.pi * REP_RATE_HZ
 
-PREFERRED_N_COMP = {"glu": 2, "form": 2, "live": 2}
+PREFERRED_N_COMP = {"glu": 3, "form": 2, "live": 2}
 TAUMEAN_CFG = {
-    "glu":  (("a1", "tau1"), ("a2", "tau2")),
+    # glu 3-comp: skip ultra-short artifact a1/tau1 (~16 ps); average over free+bound NADH
+    "glu":  (("a2", "tau2"), ("a3", "tau3")),
     "form": (("a1", "tau1"), ("a2", "tau2")),
     "live": (("a1", "tau1"), ("a2", "tau2")),
 }
@@ -174,7 +180,25 @@ def fit_dir_from_key(fit_set_key):
     return fit_dir, session_root, rel_dir, base_stem
 
 
+def _prefer_shift_zero(candidates) -> str:
+    """Among candidate rows, return the fit_set_key of the shift-zero folder.
+
+    Prefers rows whose key contains '-sz-' (SPCImage shift=zero) over '-sf-'
+    (shift=free).  Falls back to the first row if no '-sz-' match exists.
+    """
+    sz_rows = candidates[candidates["fit_set_key"].str.contains("-sz-", case=False, na=False)]
+    chosen  = sz_rows if not sz_rows.empty else candidates
+    return str(chosen.iloc[0]["fit_set_key"])
+
+
 def best_fit_key_for(filename, fixation_type, fit_map_df):
+    """Return the preferred fit_set_key for a file using PREFERRED_N_COMP.
+
+    Selection priority:
+      1. Match PREFERRED_N_COMP[fixation_type]; among ties prefer shift-zero folder.
+      2. Else: highest n_components; among ties prefer shift-zero folder.
+      3. Else: first row.
+    """
     rows = fit_map_df[fit_map_df["sdt_filename"] == filename]
     if rows.empty:
         return None
@@ -182,10 +206,12 @@ def best_fit_key_for(filename, fixation_type, fit_map_df):
     if preferred is not None and "n_components" in rows.columns:
         exact = rows[rows["n_components"] == preferred]
         if not exact.empty:
-            return str(exact.iloc[0]["fit_set_key"])
+            return _prefer_shift_zero(exact)
     if "n_components" in rows.columns:
-        return str(rows.sort_values("n_components", ascending=False).iloc[0]["fit_set_key"])
-    return str(rows.iloc[0]["fit_set_key"])
+        best_nc = rows["n_components"].max()
+        top     = rows[rows["n_components"] == best_nc]
+        return _prefer_shift_zero(top)
+    return _prefer_shift_zero(rows)
 
 
 def _draw_semicircle_with_labels(ax):
@@ -426,7 +452,13 @@ def make_pair_figure(kpcwt_row, bko_row, kpcwt_data, bko_data,
                 vals = hist_data[valid]
                 if len(vals) < 10:
                     continue
-                ax.hist(vals, bins=80, range=TAU_CLIM_PS,
+                # Percentile-based range so no bins are empty even when
+                # tau_mean distribution sits outside the image colorscale.
+                _hlo = float(np.percentile(vals, 1))
+                _hhi = float(np.percentile(vals, 99))
+                if _hhi <= _hlo:
+                    _hhi = _hlo + max(1.0, _hlo * 0.01)
+                ax.hist(vals, bins=80, range=(_hlo, _hhi),
                         color=color, alpha=0.6, density=True, label=label_prefix)
                 # photon-weighted mean
                 ph_w = hist_ph[valid].astype(float) if hist_ph is not None else None
@@ -517,7 +549,8 @@ def main():
             fit_map_df["n_components"], errors="coerce"
         ).astype("Int64")
 
-    # Merge filepath into sdt_df
+    # Deduplicate fp_map before merge: same file can appear under multiple drives
+    fp_map = fp_map.drop_duplicates(subset="filename", keep="first")
     sdt_df = sdt_df.merge(fp_map[["filename", "filepath"]], on="filename", how="left")
 
     # Keep calibrated sample files
@@ -541,6 +574,21 @@ def main():
         print("  [WARN] pct_final not in fit_analysis_summary, skipping quality filter")
 
     print(f"  {len(samples)} calibrated sample files with KPCWT/BKO cell_type")
+
+    # Shift-zero filter: drop files whose best fit key is not a sz folder.
+    if REQUIRE_SHIFT_ZERO:
+        def _has_sz_key(row):
+            k = best_fit_key_for(row["filename"], row["fixation_type"], fit_map_df)
+            return k is not None and "-sz-" in k.lower()
+
+        sz_mask = samples.apply(_has_sz_key, axis=1)
+        n_dropped = (~sz_mask).sum()
+        if n_dropped:
+            print(f"  REQUIRE_SHIFT_ZERO: dropped {n_dropped} files with no sz fit key:")
+            for fn in samples.loc[~sz_mask, "filename"]:
+                print(f"    {fn}")
+        samples = samples[sz_mask].copy()
+        print(f"  {len(samples)} files remain after shift-zero filter")
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
