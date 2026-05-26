@@ -1,9 +1,9 @@
 fixation_type,cell_type,em_filter_nm,n_images
-form,BKO,457.0,63
-form,BKO,535.0,64
-form,KPCWT,457.0,67
-form,KPCWT,535.0,42
-live,BKO,457.0,55
-live,BKO,535.0,54
-live,KPCWT,457.0,47
-live,KPCWT,535.0,47
+form,BKO,457.0,66
+form,BKO,535.0,66
+form,KPCWT,457.0,69
+form,KPCWT,535.0,44
+live,BKO,457.0,69
+live,BKO,535.0,56
+live,KPCWT,457.0,27
+live,KPCWT,535.0,26

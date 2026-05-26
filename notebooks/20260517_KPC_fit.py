@@ -164,9 +164,9 @@ data_dirs = WIN_DATA_DIRS if CURRENT_OS == "Win" else LIN_DATA_DIRS
 # None is the fallback when n_components is not parseable from the folder name.
 MIN_PHOTONS_BY_NCOMP = {
     1:     500,
-    2:   3_000,
+    2:   1_500,   # lowered from 3000: recovers dim 535nm KPCWT files (20260509)
     3:   8_000,
-    None: 3_000,
+    None: 1_500,
 }
 
 # Chi^2 acceptance window

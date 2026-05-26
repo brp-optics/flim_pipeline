@@ -235,6 +235,16 @@ ANALYSIS_SHIFT_GROUP = {
     "live": "shift=0",  # best_fit_key now prefers sz folders; check WARNING in Step 19
 }
 
+# Sessions to exclude from specific fixation types.
+# Format: {session_root_prefix: [fixation_type, ...]} or {session_root_prefix: None} to
+# exclude all fixation types from that session.
+# 20260501 live: IRF peak shifted 2-3 time bins during the PM (live) acquisition.
+# With sz (shift fixed to zero) the shift is absorbed into the lifetime components,
+# biasing tau_mean upward (~881 ps vs ~747 ps for the next KPCWT live session).
+EXCLUDE_SESSION_FT = {
+    "20260501_KPC_fixed_dishes_on_SLIM": ["live"],
+}
+
 # %% [markdown]
 # ## Step 19: Load and merge summaries
 
@@ -276,6 +286,23 @@ if annot_path.exists():
     df["position_annotation"] = df["position_annotation"].fillna("(unannotated)")
 else:
     df["position_annotation"] = "(unannotated)"
+
+# Apply session exclusions defined in EXCLUDE_SESSION_FT
+if EXCLUDE_SESSION_FT and "session_root" in df.columns:
+    _n_before_excl = len(df)
+    for _sess_excl, _ft_excl in EXCLUDE_SESSION_FT.items():
+        _sess_mask = df["session_root"].str.startswith(_sess_excl, na=False)
+        if _ft_excl is None:
+            _drop_mask = _sess_mask
+        else:
+            _drop_mask = _sess_mask & df["fixation_type"].isin(_ft_excl)
+        _n_drop = _drop_mask.sum()
+        if _n_drop:
+            _fts = "all" if _ft_excl is None else "/".join(_ft_excl)
+            print(f"EXCLUDE_SESSION_FT: dropping {_n_drop} rows"
+                  f" ({_sess_excl}, {_fts})")
+        df = df[~_drop_mask].copy()
+    print(f"  {_n_before_excl} -> {len(df)} rows after session exclusions")
 
 print(f"Combined dataframe: {len(df)} rows")
 print("\nCoverage by fixation_type x cell_type:")
@@ -1130,6 +1157,103 @@ else:
         plt.tight_layout()
         _savefig(fig, f"fig_channel_{metric}")
         plt.show()
+
+# %% [markdown]
+# ## Step 25b: Per-channel comparison -- points colored by imaging session
+#
+# Same violin layout as Step 25 (cell_type x channel x fixation_type), but
+# scatter points are colored by session_root instead of cell_type.
+# Reveals whether a group difference is driven by a single session.
+
+# %%
+if len(channels) >= 2 and CHANNEL_METRICS and "session_root" in df_analysis.columns:
+    sessions_all = sorted(df_analysis["session_root"].dropna().unique())
+    sess_cmap    = plt.cm.tab10(np.linspace(0, 0.9, max(len(sessions_all), 1)))
+    sess_color   = {s: sess_cmap[i] for i, s in enumerate(sessions_all)}
+
+    for metric in CHANNEL_METRICS:
+        label  = METRIC_LABELS.get(metric, metric)
+        n_fix  = len(fix_present)
+        n_ct   = len(ct_present)
+        n_ch   = len(channels)
+        gap    = 1.5
+        ch_offsets = [i * (n_ct + gap) for i in range(n_ch)]
+
+        fig, axes = plt.subplots(1, n_fix,
+                                 figsize=(max(5, 2.2 * n_ct * n_ch) * n_fix, 5),
+                                 squeeze=False)
+
+        for ax, fix_type in zip(axes[0], fix_present):
+            for ci, ch in enumerate(channels):
+                sub = (df_analysis[(df_analysis["fixation_type"] == fix_type) &
+                                   (df_analysis["em_filter_nm"]  == ch) &
+                                   df_analysis["cell_type"].isin(ct_present)]
+                                  .dropna(subset=[metric]))
+
+                for j, ct in enumerate(ct_present):
+                    grp = sub[sub["cell_type"] == ct]
+                    pos = ch_offsets[ci] + j
+                    vals = grp[metric].values
+                    if len(vals) >= 2:
+                        parts = ax.violinplot([vals], positions=[pos],
+                                              showmedians=True, showextrema=True)
+                        for pc in parts["bodies"]:
+                            pc.set_facecolor("0.80")
+                            pc.set_alpha(0.55)
+                        for key2 in ("cmedians", "cbars", "cmins", "cmaxes"):
+                            if key2 in parts:
+                                parts[key2].set_color("0.3")
+                    elif len(vals) == 1:
+                        ax.plot(pos, vals[0], "o", color="0.5", ms=8, zorder=4)
+
+                    # Scatter points colored by session
+                    rng25b = np.random.default_rng(seed=ci * 100 + j)
+                    for sess in sessions_all:
+                        sv = grp[grp["session_root"] == sess][metric].values
+                        if len(sv) == 0:
+                            continue
+                        jit = rng25b.uniform(-0.09, 0.09, len(sv))
+                        ax.scatter(pos + jit, sv, s=14,
+                                   color=sess_color[sess],
+                                   alpha=0.85, zorder=5,
+                                   label=sess if (ci == 0 and j == 0) else "_")
+
+            # Channel separator
+            sep_x = ch_offsets[0] + n_ct - 0.5 + gap * 0.5
+            ax.axvline(sep_x, color="0.4", lw=1.2, ls="--", zorder=1)
+
+            # X-ticks: cell_type under each violin, channel label above group
+            tick_pos, tick_label = [], []
+            for ci, ch in enumerate(channels):
+                for j, ct in enumerate(ct_present):
+                    tick_pos.append(ch_offsets[ci] + j)
+                    tick_label.append(ct)
+                mid = ch_offsets[ci] + (n_ct - 1) / 2.0
+                ax.text(mid, ax.get_ylim()[0],
+                        f"{int(ch)} nm", ha="center", va="top",
+                        fontsize=8, color="0.35",
+                        transform=ax.get_xaxis_transform())
+
+            ax.set_xticks(tick_pos)
+            ax.set_xticklabels(tick_label, fontsize=8, rotation=30, ha="right")
+            ax.set_xlim(ch_offsets[0] - 0.8, ch_offsets[-1] + n_ct - 1 + 0.8)
+            ax.set_ylabel(label)
+            ax.set_title(fix_type, fontsize=9)
+
+        # Legend: session colours
+        handles_sess = [mpatches.Patch(color=sess_color[s],
+                                       label=s.split("_")[0])  # date prefix only
+                        for s in sessions_all]
+        axes[0][-1].legend(handles=handles_sess, fontsize=7,
+                           bbox_to_anchor=(1.02, 1), loc="upper left",
+                           title="session")
+
+        fig.suptitle(f"{label}  by channel  (points = session)", fontsize=11)
+        plt.tight_layout()
+        _savefig(fig, f"fig_channel_session_{metric}")
+        plt.show()
+else:
+    print("Step 25b: session_root or channel data not available -- skipping.")
 
 # %% [markdown]
 # ## Step 26: Within-image heterogeneity
