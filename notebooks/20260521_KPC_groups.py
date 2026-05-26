@@ -431,6 +431,104 @@ fix_present = [f for f in FIXATION_ORDER  if f in df_analysis["fixation_type"].d
 ct_present  = [c for c in CELL_TYPE_ORDER if c in df_analysis["cell_type"].dropna().unique()]
 
 # %%
+# -- Step 19c: Numeric group summary ----------------------------------------
+#
+# Median, mean, SD, and n for every metric broken down by
+# (fixation_type, em_filter_nm, cell_type).  Use this table to cross-check
+# violin plots and compare against prior runs.  Printed before any figures
+# so it is visible even if a later cell crashes.
+
+print("=" * 72)
+print("NUMERIC GROUP SUMMARY  (df_analysis -- like-for-like filtered)")
+print("=" * 72)
+
+_grp_cols_19c = [c for c in ["fixation_type", "em_filter_nm", "cell_type"]
+                 if c in df_analysis.columns]
+
+for _m in all_metrics:
+    _lbl = METRIC_LABELS.get(_m, _m)
+    _sub19 = df_analysis[_grp_cols_19c + [_m]].dropna(subset=[_m])
+    if _sub19.empty:
+        continue
+    _agg19 = (_sub19.groupby(_grp_cols_19c, dropna=False)[_m]
+              .agg(n="count", median="median", mean="mean", std="std")
+              .round(1))
+    print(f"\n{_lbl}  [{_m}]")
+    print(_agg19.to_string())
+
+    # Direction: which cell_type has the higher median per (fix, channel)?
+    print("  Direction (descending median):")
+    _chans19 = sorted(df_analysis["em_filter_nm"].dropna().unique())
+    for _ft19 in fix_present:
+        for _ch19 in _chans19:
+            _meds = {}
+            for _ct19 in ct_present:
+                _v19 = df_analysis[
+                    (df_analysis["fixation_type"] == _ft19) &
+                    (df_analysis["em_filter_nm"]  == _ch19) &
+                    (df_analysis["cell_type"]     == _ct19)
+                ][_m].dropna()
+                if len(_v19) >= 2:
+                    _meds[_ct19] = float(_v19.median())
+            if len(_meds) >= 2:
+                _sorted19 = sorted(_meds.items(), key=lambda kv: -kv[1])
+                _dir19 = " > ".join(f"{k}({v:.1f})" for k, v in _sorted19)
+                print(f"    {_ft19} / {_ch19} nm: {_dir19}")
+
+print("\n" + "=" * 72)
+
+# %%
+# -- Step 19d: Per-session breakdown (session x channel x cell_type) ---------
+#
+# Median per (fixation_type, em_filter_nm, session_root, cell_type).
+# Uses df_analysis which is already filtered to shift=0 and preferred n_comp,
+# so session-size imbalances between cell_types cannot skew the aggregate.
+# If a session contains only one cell_type the comparison is confounded --
+# any group difference in that fixation_type could be a batch effect.
+
+print("=" * 72)
+print("PER-SESSION BREAKDOWN  (df_analysis: shift=0, preferred n_comp)")
+print("=" * 72)
+
+_sd_cols = [c for c in ["fixation_type", "em_filter_nm", "session_root", "cell_type"]
+            if c in df_analysis.columns]
+
+for _m in all_metrics:
+    _lbl = METRIC_LABELS.get(_m, _m)
+    _sub_sd = df_analysis[_sd_cols + [_m]].dropna(subset=[_m])
+    if _sub_sd.empty:
+        continue
+    _agg_sd = (_sub_sd.groupby(_sd_cols, dropna=False)[_m]
+               .agg(n="count", median="median")
+               .round(1))
+    print(f"\n{_lbl}  [{_m}]")
+    print(_agg_sd.to_string())
+
+# Confounding summary (independent of metric)
+if "session_root" in df_analysis.columns:
+    print("\nSession/cell_type overlap per fixation_type:")
+    for _ft_s in fix_present:
+        _sub_ft = df_analysis[df_analysis["fixation_type"] == _ft_s]
+        _sess_ct = (_sub_ft.groupby(["session_root", "cell_type"], dropna=False)
+                    .size().unstack("cell_type", fill_value=0))
+        _ct_cols_s = [c for c in ct_present if c in _sess_ct.columns]
+        if len(_ct_cols_s) < 2:
+            print(f"  {_ft_s}: only one cell_type present -- cannot assess overlap")
+            continue
+        _n_both  = (_sess_ct[_ct_cols_s] > 0).all(axis=1).sum()
+        _n_total = len(_sess_ct)
+        if _n_both == 0:
+            print(f"  {_ft_s}: FULLY CONFOUNDED -- 0/{_n_total} sessions"
+                  f" contain both cell_types")
+        elif _n_both < _n_total:
+            print(f"  {_ft_s}: PARTIAL -- {_n_both}/{_n_total} sessions"
+                  f" contain both cell_types")
+        else:
+            print(f"  {_ft_s}: OK -- all {_n_total} sessions contain both cell_types")
+
+print("\n" + "=" * 72)
+
+# %%
 # -- Step 19b: Bimodality diagnosis -----------------------------------------
 #
 # Before group comparison, test the three hypotheses for bimodal distributions:
@@ -573,63 +671,108 @@ else:
         plt.show()
 
 # %% [markdown]
-# ## Step 21: Violin plots by cell_type x fixation_type
+# ## Step 21: Violin plots by cell_type x fixation_type x em_filter_nm
 #
 # Each violin shows the distribution of per-image medians.
-# One figure per metric; one panel per fixation_type.
+# Layout: rows = fixation_type, columns = emission channel (457 / 535 nm).
 # Individual data points overlaid as a strip plot.
+# Both channel panels share the same y-axis so amplitudes are directly comparable.
 
 # %%
 palette  = plt.cm.Set2(np.linspace(0, 0.8, max(len(ct_present), 1)))
 ct_color = {ct: palette[i] for i, ct in enumerate(ct_present)}
 
+_channels_21 = sorted(df_analysis["em_filter_nm"].dropna().unique())
+_n_rows      = len(fix_present)
+_n_cols      = max(len(_channels_21), 1)
+
 for metric in all_metrics:
     label = METRIC_LABELS.get(metric, metric)
-    fig, axes = plt.subplots(1, len(fix_present),
-                             figsize=(4 * len(fix_present), 5),
-                             squeeze=False)
+    fig, axes = plt.subplots(_n_rows, _n_cols,
+                             figsize=(4 * _n_cols, 4 * _n_rows),
+                             squeeze=False,
+                             sharey=True)
 
-    for ax, fix_type in zip(axes[0], fix_present):
-        sub = (df_analysis[(df_analysis["fixation_type"] == fix_type) &
-                           df_analysis["cell_type"].isin(ct_present)]
-               .dropna(subset=[metric]))
+    for ri, fix_type in enumerate(fix_present):
+        for ci, ch in enumerate(_channels_21):
+            ax = axes[ri][ci]
+            sub = (df_analysis[(df_analysis["fixation_type"] == fix_type) &
+                               (df_analysis["em_filter_nm"]  == ch) &
+                               df_analysis["cell_type"].isin(ct_present)]
+                   .dropna(subset=[metric]))
 
-        # Require >= 2 non-NaN values per group: violinplot KDE fails with n < 2.
-        # sub is already dropna'd on metric above, so .sum() counts non-NaN rows.
-        cts_here  = [ct for ct in ct_present if (sub["cell_type"] == ct).sum() >= 2]
-        groups    = [sub[sub["cell_type"] == ct][metric].values for ct in cts_here]
-        colors    = [ct_color[ct] for ct in cts_here]
+            # Require >= 2 non-NaN values per group: violinplot KDE fails with n < 2.
+            cts_here = [ct for ct in ct_present
+                        if (sub["cell_type"] == ct).sum() >= 2]
+            groups   = [sub[sub["cell_type"] == ct][metric].values for ct in cts_here]
+            colors   = [ct_color[ct] for ct in cts_here]
 
-        if not groups:
-            ax.set_title(f"{fix_type}\n(no data)")
-            continue
+            if not groups:
+                ax.set_title(f"{fix_type} / {ch} nm\n(no data)", fontsize=8)
+                continue
 
-        parts = ax.violinplot(groups, positions=range(len(groups)),
-                              showmedians=True, showextrema=True)
-        for pc, col in zip(parts["bodies"], colors):
-            pc.set_facecolor(col)
-            pc.set_alpha(0.65)
-        for key in ("cmedians", "cbars", "cmins", "cmaxes"):
-            if key in parts:
-                parts[key].set_color("k")
-                parts[key].set_linewidth(1.2)
+            parts = ax.violinplot(groups, positions=range(len(groups)),
+                                  showmedians=True, showextrema=True)
+            for pc, col in zip(parts["bodies"], colors):
+                pc.set_facecolor(col)
+                pc.set_alpha(0.65)
+            for key in ("cmedians", "cbars", "cmins", "cmaxes"):
+                if key in parts:
+                    parts[key].set_color("k")
+                    parts[key].set_linewidth(1.2)
 
-        rng = np.random.default_rng(seed=0)
-        for j, (grp, col) in enumerate(zip(groups, colors)):
-            jitter = rng.uniform(-0.07, 0.07, len(grp))
-            ax.scatter(j + jitter, grp, s=14, color=col, alpha=0.6, zorder=3)
+            rng = np.random.default_rng(seed=0)
+            for j, (grp, col) in enumerate(zip(groups, colors)):
+                jitter = rng.uniform(-0.07, 0.07, len(grp))
+                ax.scatter(j + jitter, grp, s=14, color=col, alpha=0.6, zorder=3)
 
-        ax.set_xticks(range(len(cts_here)))
-        ax.set_xticklabels(cts_here, fontsize=9)
-        ax.set_ylabel(label)
-        n_str = "  ".join(f"{ct}:{(sub['cell_type']==ct).sum()}"
-                          for ct in cts_here)
-        ax.set_title(f"{fix_type}\nn={n_str}", fontsize=8)
+            ax.set_xticks(range(len(cts_here)))
+            ax.set_xticklabels(cts_here, fontsize=9)
+            if ci == 0:
+                ax.set_ylabel(label)
+            n_str = "  ".join(f"{ct}:{(sub['cell_type']==ct).sum()}"
+                              for ct in cts_here)
+            ax.set_title(f"{fix_type} / {ch} nm\nn={n_str}", fontsize=8)
 
     fig.suptitle(label, fontsize=11)
     plt.tight_layout()
     _savefig(fig, f"fig_violin_{metric}")
     plt.show()
+
+# %%
+# -- Step 21b: Direction check (text) ----------------------------------------
+# Prints the median per group for every violin so the direction of any
+# difference is unambiguous regardless of color-blind or scaling issues.
+
+print("=" * 72)
+print("STEP 21 DIRECTION CHECK  (median per group, analysis dataset)")
+print("=" * 72)
+_chans_21b = sorted(df_analysis["em_filter_nm"].dropna().unique())
+for _m21 in all_metrics:
+    _lbl21 = METRIC_LABELS.get(_m21, _m21)
+    _any21  = False
+    _lines21 = []
+    for _ft21 in fix_present:
+        for _ch21 in _chans_21b:
+            _meds21 = {}
+            for _ct21 in ct_present:
+                _v21 = df_analysis[
+                    (df_analysis["fixation_type"] == _ft21) &
+                    (df_analysis["em_filter_nm"]  == _ch21) &
+                    (df_analysis["cell_type"]     == _ct21)
+                ][_m21].dropna()
+                if len(_v21) >= 2:
+                    _meds21[_ct21] = float(_v21.median())
+                    _any21 = True
+            if _meds21:
+                _s21 = sorted(_meds21.items(), key=lambda kv: -kv[1])
+                _dir21 = " > ".join(f"{k}({v:.1f})" for k, v in _s21)
+                _lines21.append(f"  {_ft21:6s} / {_ch21} nm : {_dir21}")
+    if _any21:
+        print(f"\n{_lbl21}  [{_m21}]")
+        for _ln in _lines21:
+            print(_ln)
+print("=" * 72)
 
 # %% [markdown]
 # ## Step 22: Pairwise statistical tests

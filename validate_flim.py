@@ -28,6 +28,9 @@ WIN_DATA_DIRS = [
     Path(r"E:\18_RK_Circadian\data\raw\20260509_KPC_fixed_dishes_on_SLIM"),
     Path(r"E:\18_RK_Circadian\data\raw\20260508_KPC_live_on_SLIM"),
     Path(r"E:\18_RK_Circadian\data\raw\20260517_KPC_live_on_SLIM"),
+    Path(r"E:\18_RK_Circadian\data\raw\20260520_KPC_fixed_dishes_SLIM"),
+    Path(r"E:\18_RK_Circadian\data\raw\20260521_KPC_live_SLIM"),
+    Path(r"E:\18_RK_Circadian\data\raw\20260522_KPC_fixed_dishes_SLIM"),
 ]
 LIN_DATA_DIRS = [
     Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260429_KPC_fixed_dishes_on_SLIM"),
@@ -35,6 +38,9 @@ LIN_DATA_DIRS = [
     Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260509_KPC_fixed_dishes_on_SLIM"),
     Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260508_KPC_live_on_SLIM"),
     Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260517_KPC_live_on_SLIM"),
+    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260520_KPC_fixed_dishes_SLIM"),
+    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260521_KPC_live_SLIM"),
+    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260522_KPC_fixed_dishes_SLIM"),
 ]
 CURRENT_OS = "Win"
 data_dirs = WIN_DATA_DIRS if CURRENT_OS == "Win" else LIN_DATA_DIRS
@@ -52,11 +58,12 @@ TAU_CLIM_PS = (400, 1400)
 PHASOR_TAU_LABELS_NS = [1, 2, 3, 4, 5, 6, 7, 8]
 
 # Preferred fit components per fixation type (mirrors Phase E)
-PREFERRED_N_COMP = {"glu": 2, "form": 2, "live": 2}
+PREFERRED_N_COMP = {"glu": 3, "form": 2, "live": 2}
 
 # Amplitude-weighted tau_mean component pairs (a_key, tau_key)
+# glu: skip ultra-short artifact a1; use a2/tau2 (free NADH) + a3/tau3 (bound NADH)
 TAUMEAN_CFG = {
-    "glu":  (("a1", "tau1"), ("a2", "tau2")),
+    "glu":  (("a2", "tau2"), ("a3", "tau3")),
     "form": (("a1", "tau1"), ("a2", "tau2")),
     "live": (("a1", "tau1"), ("a2", "tau2")),
 }
@@ -66,7 +73,7 @@ CHI2_LO = 0.8
 CHI2_HI = 2.0
 MIN_PHOTONS_BY_NCOMP = {1: 500, 2: 3_000, 3: 8_000, None: 3_000}
 TAU_BOUNDS = {
-    "glu":  {"tau1": (50.0, 1500.0), "tau2": (800.0, 6000.0)},
+    "glu":  {"tau1": (0.0,  200.0),  "tau2": (50.0, 1200.0), "tau3": (800.0, 6000.0)},
     "form": {"tau1": (50.0, 1500.0), "tau2": (800.0, 6000.0)},
     "live": {"tau1": (50.0, 1500.0), "tau2": (800.0, 6000.0)},
 }
@@ -185,7 +192,25 @@ def fit_dir_from_key(fit_set_key):
     return fit_dir, session_root, rel_dir, base_stem
 
 
+def _prefer_shift_zero(candidates) -> str:
+    """Among candidate rows, return the fit_set_key of the shift-zero folder.
+
+    Prefers rows whose key contains '-sz-' (SPCImage shift=zero) over '-sf-'
+    (shift=free).  Falls back to the first row if no '-sz-' match exists.
+    """
+    sz_rows = candidates[candidates["fit_set_key"].str.contains("-sz-", case=False, na=False)]
+    chosen  = sz_rows if not sz_rows.empty else candidates
+    return str(chosen.iloc[0]["fit_set_key"])
+
+
 def best_fit_key_for(filename, fixation_type, fit_map_df):
+    """Return the preferred fit_set_key for a file using PREFERRED_N_COMP.
+
+    Selection priority:
+      1. Match PREFERRED_N_COMP[fixation_type]; among ties prefer shift-zero folder.
+      2. Else: highest n_components; among ties prefer shift-zero folder.
+      3. Else: first row.
+    """
     rows = fit_map_df[fit_map_df["sdt_filename"] == filename]
     if rows.empty:
         return None
@@ -193,10 +218,12 @@ def best_fit_key_for(filename, fixation_type, fit_map_df):
     if preferred is not None and "n_components" in rows.columns:
         exact = rows[rows["n_components"] == preferred]
         if not exact.empty:
-            return str(exact.iloc[0]["fit_set_key"])
+            return _prefer_shift_zero(exact)
     if "n_components" in rows.columns:
-        return str(rows.sort_values("n_components", ascending=False).iloc[0]["fit_set_key"])
-    return str(rows.iloc[0]["fit_set_key"])
+        best_nc = rows["n_components"].max()
+        top     = rows[rows["n_components"] == best_nc]
+        return _prefer_shift_zero(top)
+    return _prefer_shift_zero(rows)
 
 
 def compute_quality_mask(fd, fixation_type, b_val, n_components=None):
