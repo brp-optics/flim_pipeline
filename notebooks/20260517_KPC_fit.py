@@ -164,9 +164,9 @@ data_dirs = WIN_DATA_DIRS if CURRENT_OS == "Win" else LIN_DATA_DIRS
 # None is the fallback when n_components is not parseable from the folder name.
 MIN_PHOTONS_BY_NCOMP = {
     1:     500,
-    2:   1_500,   # lowered from 3000: recovers dim 535nm KPCWT files (20260509)
+    2:   1_000,    # lowered from 3000 to recover dim BKO acquisitions
     3:   8_000,
-    None: 1_500,
+    None: 1_000,
 }
 
 # Chi^2 acceptance window
@@ -226,6 +226,14 @@ RATIO_CFG = {
 
 # Preferred number of fit components per fixation_type (for Steps 16-18)
 PREFERRED_N_COMP = {"glu": 3, "form": 2, "live": 2}
+
+# Per-session bin-radius override.  When a session was re-exported in SPCImage
+# at a specific bin to recover dim acquisitions, list it here.  best_fit_key()
+# restricts candidates to that bin before applying n_comp and shift preferences.
+# Only affects listed sessions; all other sessions use their normal fit selection.
+PREFERRED_BIN_OVERRIDE = {
+    "20260509_KPC_fixed_dishes_on_SLIM": 10,
+}
 
 # %% [markdown]
 # ## Step 14: Load outputs and define helpers
@@ -397,6 +405,13 @@ def load_saved_mask(fit_set_key: str) -> np.ndarray | None:
     return np.load(str(p)) if p.exists() else None
 
 
+def _parse_bin_radius(key: str) -> int:
+    """Parse bin radius from fit_set_key string, e.g. 'fitet-sz-c2-b10' -> 10.
+    Returns 0 if no bin token found."""
+    m = re.search(r"[-_]b(\d+)", str(key), re.IGNORECASE)
+    return int(m.group(1)) if m else 0
+
+
 def _prefer_shift_zero(candidates) -> str:
     """Among candidate rows, return the fit_set_key of the shift-zero folder.
 
@@ -409,26 +424,26 @@ def _prefer_shift_zero(candidates) -> str:
 
 
 def best_fit_key(filename: str, fixation_type: str = None) -> str | None:
-    """Return the preferred fit_set_key for a file using PREFERRED_N_COMP.
-
-    Selection priority:
-      1. Match PREFERRED_N_COMP[fixation_type]; among ties prefer shift-zero folder.
-      2. Else: highest n_components; among ties prefer shift-zero folder.
-      3. Else: first row.
+    """Return the highest-bin fit_set_key matching the hard constraints:
+       n_components == PREFERRED_N_COMP[fixation_type]  AND  shift-zero folder.
+    Returns None if no fit satisfies both constraints.
     """
     rows = fit_map_df[fit_map_df["sdt_filename"] == filename]
     if rows.empty:
         return None
+    # Hard constraint: n_components
     preferred = PREFERRED_N_COMP.get(str(fixation_type)) if fixation_type else None
     if preferred is not None and "n_components" in rows.columns:
-        exact = rows[rows["n_components"] == preferred]
-        if not exact.empty:
-            return _prefer_shift_zero(exact)
-    if "n_components" in rows.columns:
-        best_nc = rows["n_components"].max()
-        top     = rows[rows["n_components"] == best_nc]
-        return _prefer_shift_zero(top)
-    return _prefer_shift_zero(rows)
+        rows = rows[rows["n_components"] == preferred]
+        if rows.empty:
+            return None
+    # Hard constraint: shift-zero (sz folder)
+    rows = rows[rows["fit_set_key"].str.contains("-sz-", case=False, na=False)]
+    if rows.empty:
+        return None
+    # Among survivors, pick the highest bin
+    rows = rows.assign(_bin=rows["fit_set_key"].apply(_parse_bin_radius))
+    return str(rows.sort_values("_bin", ascending=False).iloc[0]["fit_set_key"])
 
 
 # -- Helpers: masking and analysis ------------------------------------------
@@ -1100,8 +1115,10 @@ for _, row in sample_df.iterrows():
         "fixation_type":     fixation_type,
         "cell_type":         row.get("cell_type"),
         "em_filter_nm":      row.get("em_filter_nm"),
+        "pockels":           row.get("pockels"),
         "acquisition_time":  row.get("acquisition_time"),
         "fit_set_key":       key,
+        "fit_mask_path":     str(fit_dir / f"{base_stem}_fit_mask.npy"),
         "n_components":      fm.get("n_components"),   # explicit column for downstream filtering
         "n_px_total":        n_total,
         "n_px_final":        n_final,
@@ -1209,3 +1226,9 @@ print(f"\nSaved: {results_dir / 'fit_analysis_summary.csv'}")
 # %%
 
 # %%
+
+# %%
+import winsound as _ws, time as _t
+for _ in range(3):
+    _ws.Beep(1000, 400)
+    _t.sleep(1)

@@ -1056,3 +1056,9 @@ except ImportError:
     print("openpyxl not installed -- using CSV only (run: uv add --dev openpyxl)")
 
 # %%
+
+# %%
+import winsound as _ws, time as _t
+for _ in range(3):
+    _ws.Beep(1000, 400)
+    _t.sleep(1)

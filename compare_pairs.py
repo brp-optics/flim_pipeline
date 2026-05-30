@@ -61,6 +61,12 @@ REP_RATE_HZ = 80e6
 OMEGA = 2 * np.pi * REP_RATE_HZ
 
 PREFERRED_N_COMP = {"glu": 3, "form": 2, "live": 2}
+
+# Per-session bin-radius override.  See Phase E for rationale.
+PREFERRED_BIN_OVERRIDE = {
+    "20260509_KPC_fixed_dishes_on_SLIM": 10,
+}
+
 TAUMEAN_CFG = {
     # glu 3-comp: skip ultra-short artifact a1/tau1 (~16 ps); average over free+bound NADH
     "glu":  (("a2", "tau2"), ("a3", "tau3")),
@@ -180,6 +186,13 @@ def fit_dir_from_key(fit_set_key):
     return fit_dir, session_root, rel_dir, base_stem
 
 
+def _parse_bin_radius(key: str) -> int:
+    """Parse bin radius from fit_set_key string, e.g. 'fitet-sz-c2-b10' -> 10.
+    Returns 0 if no bin token found."""
+    m = re.search(r"[-_]b(\d+)", str(key), re.IGNORECASE)
+    return int(m.group(1)) if m else 0
+
+
 def _prefer_shift_zero(candidates) -> str:
     """Among candidate rows, return the fit_set_key of the shift-zero folder.
 
@@ -195,6 +208,9 @@ def best_fit_key_for(filename, fixation_type, fit_map_df):
     """Return the preferred fit_set_key for a file using PREFERRED_N_COMP.
 
     Selection priority:
+      0. If the session has a PREFERRED_BIN_OVERRIDE entry, restrict candidates
+         to that bin radius before any other selection.  Falls through if the
+         preferred bin has no matching fit set for this file.
       1. Match PREFERRED_N_COMP[fixation_type]; among ties prefer shift-zero folder.
       2. Else: highest n_components; among ties prefer shift-zero folder.
       3. Else: first row.
@@ -202,6 +218,13 @@ def best_fit_key_for(filename, fixation_type, fit_map_df):
     rows = fit_map_df[fit_map_df["sdt_filename"] == filename]
     if rows.empty:
         return None
+    if PREFERRED_BIN_OVERRIDE:
+        _sess = str(rows.iloc[0]["fit_set_key"]).split("::")[0]
+        if _sess in PREFERRED_BIN_OVERRIDE:
+            _bin_rows = rows[rows["fit_set_key"].apply(_parse_bin_radius)
+                            == PREFERRED_BIN_OVERRIDE[_sess]]
+            if not _bin_rows.empty:
+                rows = _bin_rows
     preferred = PREFERRED_N_COMP.get(str(fixation_type))
     if preferred is not None and "n_components" in rows.columns:
         exact = rows[rows["n_components"] == preferred]

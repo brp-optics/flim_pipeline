@@ -25,7 +25,7 @@ plt.title("IRF")
 plt.show()
 # %%
 
-%matplotlib inline
+# %matplotlib inline
 # %%
 print(os.getcwd())
 

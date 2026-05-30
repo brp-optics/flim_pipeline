@@ -62,7 +62,7 @@
 # Step 22 uses a two-sided Mann-Whitney U test on per-image medians.
 # All pairwise cell_type combinations per (fixation_type, metric) block
 # are tested together; p-values are corrected with Benjamini-Hochberg FDR.
-# Effect size: rank-biserial r = 1 - 2U/(n1*n2).
+# Effect size: rank-biserial r = 2U/(n1*n2) - 1.
 #   |r| < 0.3 small, 0.3-0.5 medium, > 0.5 large.
 #   Positive r: group_a tends to be larger than group_b.
 # Only cell_type groups with >= MIN_N images are included.
@@ -235,6 +235,22 @@ ANALYSIS_SHIFT_GROUP = {
     "live": "shift=0",  # best_fit_key now prefers sz folders; check WARNING in Step 19
 }
 
+# Pockels-cell voltage filter.
+# Metadata shows a confirmed two-cluster distribution: low cluster <= 0.25,
+# high cluster >= 0.45 (gap of 0.20).  High pockels = lower irradiance per
+# pixel -> fewer photons -> shifted fitted lifetime.  Mixing clusters can
+# reverse the apparent BKO vs KPCWT direction.
+# Set None to disable (includes all pockels values).
+MAX_POCKELS = 0.25
+
+# Z-stack first-slice filter.
+# OpenScan saves one .sdt file per shutter close (one per z-step), so the
+# frame_index column encodes z-stack depth (0 = first slice, 1 = second, ...).
+# When True, live acquisitions are restricted to frame_index=0 so each
+# physical position contributes exactly one data point.
+# Set False to include all z-slices.
+LIVE_FIRST_FRAME_ONLY = True
+
 # Sessions to exclude from specific fixation types.
 # Format: {session_root_prefix: [fixation_type, ...]} or {session_root_prefix: None} to
 # exclude all fixation types from that session.
@@ -266,12 +282,16 @@ df = fit_df.merge(
     on="filename", how="outer",
 )
 
-# Bring in acquisition_time and session_root from sdt_df if absent
-meta_cols = [c for c in ["acquisition_time", "session_root"]
-             if c not in df.columns]
-if meta_cols:
-    df = df.merge(sdt_df[["filename"] + meta_cols], on="filename", how="left")
-df["acquisition_time"] = pd.to_datetime(df["acquisition_time"])
+# Always pull acquisition_time, pockels, frame_index from sdt_df.
+# fit_analysis_summary.csv often comes back from Excel with datetime columns
+# truncated to "MM:SS.f" time-only strings, so any pre-existing values are
+# unreliable -- drop them and re-merge from sdt_df.
+df = df.drop(columns=["acquisition_time", "pockels", "frame_index"], errors="ignore")
+df = df.merge(
+    sdt_df[["filename", "acquisition_time", "pockels", "frame_index"]],
+    on="filename", how="left",
+)
+# sdt_df["acquisition_time"] was parsed to datetime at load time.
 
 # Merge position annotations
 annot_path = results_dir / "position_annotation.csv"
@@ -435,6 +455,34 @@ elif ANALYSIS_SHIFT_GROUP is not None:
     if n_drop > 0:
         print(f"  shift filter: dropped {n_drop} rows not in '{ANALYSIS_SHIFT_GROUP}'")
     df_analysis = df_analysis[mask_shift]
+
+# -- Pockels filter -----------------------------------------------------------
+if MAX_POCKELS is not None and "pockels" in df_analysis.columns:
+    _n_hi_poc = (df_analysis["pockels"] > MAX_POCKELS).sum()
+    if _n_hi_poc:
+        print(f"  pockels filter: dropped {_n_hi_poc} rows"
+              f" with pockels > {MAX_POCKELS}")
+    df_analysis = df_analysis[df_analysis["pockels"] <= MAX_POCKELS].copy()
+    print("\nPockels distribution after filter (all rows in df_analysis):")
+    print(df_analysis["pockels"].value_counts(dropna=False).sort_index().to_string())
+elif "pockels" not in df_analysis.columns:
+    print("  WARNING: pockels column not found - MAX_POCKELS filter skipped.")
+
+# -- Z-stack first-slice filter -----------------------------------------------
+# Restricts LIVE acquisitions to frame_index=0 (first z-slice) so each
+# physical position contributes exactly one row.  Form and glu acquisitions
+# are single focal planes and are not filtered.
+if LIVE_FIRST_FRAME_ONLY and "frame_index" in df_analysis.columns:
+    _live_mask = df_analysis["fixation_type"] == "live"
+    _n_frames_drop = (_live_mask & (df_analysis["frame_index"] > 0)).sum()
+    if _n_frames_drop:
+        print(f"  frame_index filter: dropped {_n_frames_drop} live rows"
+              f" with frame_index > 0 (z-slice >= 1)")
+    df_analysis = df_analysis[
+        ~_live_mask | (df_analysis["frame_index"] == 0)
+    ].copy()
+elif LIVE_FIRST_FRAME_ONLY and "frame_index" not in df_analysis.columns:
+    print("  WARNING: frame_index column not found - LIVE_FIRST_FRAME_ONLY filter skipped.")
 
 print(f"\nAnalysis dataset: {len(df_analysis)} rows  "
       f"(from {len(df)} total; "
@@ -802,13 +850,96 @@ for _m21 in all_metrics:
 print("=" * 72)
 
 # %% [markdown]
+# ## Step 21c: Per-session, per-channel violin plots
+#
+# One figure per (metric, fixation_type, channel).
+# Columns = individual imaging sessions (date extracted from session_root).
+# Within each column: violins per cell_type, shared y-axis across sessions.
+#
+# Purpose: check whether the direction of BKO vs KPCWT is consistent within
+# each session.  If two sessions disagree (e.g. 20260509 and 20260520 for
+# tau_mean at 457 nm), the aggregate Step 21 violin is unreliable for that
+# metric/channel, and only metrics that agree across sessions are defensible.
+
+# %%
+for _m21c in all_metrics:
+    _lbl21c = METRIC_LABELS.get(_m21c, _m21c)
+    for _ft21c in fix_present:
+        for _ch21c in sorted(df_analysis["em_filter_nm"].dropna().unique()):
+            _sub_fc = (df_analysis[
+                (df_analysis["fixation_type"] == _ft21c) &
+                (df_analysis["em_filter_nm"]  == _ch21c) &
+                df_analysis["cell_type"].isin(ct_present)
+            ].dropna(subset=[_m21c]))
+            if _sub_fc.empty:
+                continue
+
+            _sessions_fc = sorted(_sub_fc["session_root"].dropna().unique())
+            if not _sessions_fc:
+                continue
+
+            _n_sess21c = len(_sessions_fc)
+            _fig21c, _axes21c = plt.subplots(
+                1, _n_sess21c,
+                figsize=(max(2.8, 2.2 * len(ct_present)) * _n_sess21c, 4.5),
+                squeeze=False,
+                sharey=True,
+            )
+
+            for _si, _sess in enumerate(_sessions_fc):
+                _ax = _axes21c[0][_si]
+                _sub_s = _sub_fc[_sub_fc["session_root"] == _sess]
+                _cts_s = [ct for ct in ct_present
+                          if (_sub_s["cell_type"] == ct).sum() >= 2]
+                _grps_s = [_sub_s[_sub_s["cell_type"] == ct][_m21c].values
+                           for ct in _cts_s]
+                _cols_s = [ct_color[ct] for ct in _cts_s]
+
+                if not _grps_s:
+                    _ax.set_title(f"{_sess.split('_')[0]}\n(no data)", fontsize=8)
+                    continue
+
+                _parts21c = _ax.violinplot(_grps_s, positions=range(len(_grps_s)),
+                                           showmedians=True, showextrema=True)
+                for _pc, _col in zip(_parts21c["bodies"], _cols_s):
+                    _pc.set_facecolor(_col)
+                    _pc.set_alpha(0.65)
+                for _key in ("cmedians", "cbars", "cmins", "cmaxes"):
+                    if _key in _parts21c:
+                        _parts21c[_key].set_color("k")
+                        _parts21c[_key].set_linewidth(1.2)
+
+                _rng21c = np.random.default_rng(seed=_si)
+                for _j, (_grp, _col) in enumerate(zip(_grps_s, _cols_s)):
+                    _jit = _rng21c.uniform(-0.07, 0.07, len(_grp))
+                    _ax.scatter(_j + _jit, _grp, s=14,
+                                color=_col, alpha=0.6, zorder=3)
+
+                _ax.set_xticks(range(len(_cts_s)))
+                _ax.set_xticklabels(_cts_s, fontsize=9)
+                if _si == 0:
+                    _ax.set_ylabel(_lbl21c)
+                _n_s = "  ".join(f"{ct}:{(_sub_s['cell_type']==ct).sum()}"
+                                 for ct in _cts_s)
+                _ax.set_title(f"{_sess.split('_')[0]}\nn={_n_s}", fontsize=8)
+
+            _fig21c.suptitle(
+                f"{_lbl21c}  |  {_ft21c}  |  {int(_ch21c)} nm  (per session)",
+                fontsize=10,
+            )
+            plt.tight_layout()
+            _savefig(_fig21c,
+                     f"fig_violin_sess_{_ft21c}_{int(_ch21c)}_{_m21c}")
+            plt.show()
+
+# %% [markdown]
 # ## Step 22: Pairwise statistical tests
 #
 # For each (fixation_type, metric): Mann-Whitney U on all pairs of cell_types
 # with >= MIN_N images. Benjamini-Hochberg FDR applied across all pairs
 # within each (fixation_type, metric) block.
 #
-# Effect size: rank-biserial r = 1 - 2U/(n1*n2).
+# Effect size: rank-biserial r = 2U/(n1*n2) - 1.
 # Interpretation: |r| < 0.3 small, 0.3-0.5 medium, > 0.5 large.
 # Sign: positive r means group_a tends to be larger than group_b.
 
@@ -830,12 +961,17 @@ def benjamini_hochberg(pvals: list) -> np.ndarray:
 
 
 def rank_biserial_r(x: np.ndarray, y: np.ndarray) -> float:
-    """Rank-biserial correlation as effect size for Mann-Whitney U."""
+    """Rank-biserial correlation as effect size for Mann-Whitney U.
+
+    r = 2U/(n1*n2) - 1.
+    Positive r means x (group_a) tends to be LARGER than y (group_b).
+    U is the statistic for x vs y (scipy returns U for x).
+    """
     n1, n2 = len(x), len(y)
     if n1 == 0 or n2 == 0:
         return np.nan
     U = stats.mannwhitneyu(x, y, alternative="two-sided").statistic
-    return float(1.0 - 2.0 * U / (n1 * n2))
+    return float(2.0 * U / (n1 * n2) - 1.0)
 
 
 stat_rows = []
@@ -1382,7 +1518,8 @@ if not size_tbl.empty:
 #
 # Step 22 -- Statistics: Mann-Whitney U (non-parametric, no normality assumption).
 #   BH-FDR applied per (fixation_type, metric) block.
-#   Effect size r: |r| < 0.3 small, 0.3-0.5 medium, > 0.5 large.
+#   Effect size r = 2U/(n1*n2) - 1: positive = group_a larger than group_b.
+#   |r| < 0.3 small, 0.3-0.5 medium, > 0.5 large.
 #   Note: treating each image as an independent replicate is conservative if
 #   multiple images came from the same dish. Mixed-effects models would be
 #   needed to account for dish-level clustering.
@@ -1394,3 +1531,292 @@ if not size_tbl.empty:
 # Saved:
 #   results/stat_tests.csv      -- all pairwise Mann-Whitney tests
 #   results/group_summary.csv   -- group means +/- SEM
+
+# %% [markdown]
+# ---
+# ## Part 2: amp_ratio -- colony annotation and fixation-duration subsets
+#
+# Four figures showing KPCWT vs BKO amp_ratio_median (shift=0, 2-comp).
+# Scatter points on each violin are individual image medians.
+#
+# Fig 1  -- form fixation, all images.
+#   Panels: 10 min / 20 min / combined  x  457 nm / 535 nm.
+#   Point color: colony_deep (blue) | peripheral (orange) | unannotated (gray).
+#
+# Fig 2  -- live, all images.
+#   Panels: 457 nm / 535 nm.
+#   Point color: same three-color scheme.
+#
+# Fig 3  -- form fixation, colony_deep images only.
+#   Panels: 10 min / 20 min  x  457 nm / 535 nm.
+#   Points colored by cell_type (colony annotation not needed; all deep).
+#
+# Fig 4  -- live, colony_deep images only.
+#   Panels: 457 nm / 535 nm.
+#   Points colored by cell_type.
+#
+# treatment_duration is read from sdt_metadata_cal.csv (column already present).
+# ---
+
+# %%
+# -- Part 2 setup -----------------------------------------------------------
+
+# Merge treatment_duration from sdt_df into df_analysis if not present yet.
+# sdt_df was loaded in Step 19 and is still in scope.
+if "treatment_duration" not in df_analysis.columns:
+    _td_col = (sdt_df[["filename", "treatment_duration"]]
+               .drop_duplicates("filename"))
+    df_analysis = df_analysis.merge(_td_col, on="filename", how="left")
+    df_analysis["treatment_duration"] = (
+        df_analysis["treatment_duration"].fillna("").astype(str)
+    )
+
+# Colony annotation categories and colors
+_CAT_DEEP   = "colony_deep"
+_CAT_PERIPH = "peripheral"
+_CAT_UNANN  = "unannotated"
+_CAT_COLORS = {
+    _CAT_DEEP:   "#4393c3",   # blue
+    _CAT_PERIPH: "#d6604d",   # orange-red
+    _CAT_UNANN:  "#aaaaaa",   # gray
+}
+
+# Annotate every row in df_analysis
+df_analysis["_colony_cat"] = df_analysis["position_annotation"].apply(
+    lambda x: _CAT_DEEP   if x == "colony_deep"
+              else (_CAT_PERIPH if x in ("colony_edge", "colony_island")
+                    else _CAT_UNANN)
+)
+
+# Boolean masks (applied to df_analysis which is already shift=0, 2-comp filtered)
+_M_FORM_10  = (df_analysis["fixation_type"] == "form") & (df_analysis["treatment_duration"] == "10min")
+_M_FORM_20  = (df_analysis["fixation_type"] == "form") & (df_analysis["treatment_duration"] == "20min")
+_M_FORM_ALL = (df_analysis["fixation_type"] == "form")
+_M_LIVE_ALL = (df_analysis["fixation_type"] == "live")
+_M_DEEP     = (df_analysis["position_annotation"] == "colony_deep")
+
+_P2_CHANNELS = sorted(df_analysis["em_filter_nm"].dropna().unique())
+_P2_CT       = [c for c in ["KPCWT", "BKO"] if c in ct_present]
+_P2_METRIC   = "amp_ratio_median"
+
+print("treatment_duration distribution (form only):")
+print(df_analysis[_M_FORM_ALL]["treatment_duration"].value_counts(dropna=False).to_string())
+print()
+print(f"Form 10 min : {_M_FORM_10.sum()} rows")
+print(f"Form 20 min : {_M_FORM_20.sum()} rows")
+print(f"Form combined: {_M_FORM_ALL.sum()} rows")
+print(f"Live         : {_M_LIVE_ALL.sum()} rows")
+print()
+print("Colony annotation counts (df_analysis):")
+print(df_analysis["_colony_cat"].value_counts(dropna=False).to_string())
+
+
+# %%
+# -- Helper: draw one violin + scatter panel --------------------------------
+#
+# Draws gray violins (so colored scatter is legible), then overlays scatter
+# points.  When point_col / color_map are given, scatter is colored by that
+# column; otherwise points use the ct_color palette (for deep-only figures).
+
+def _p2_amp_panel(ax, df_sub, group_order, metric=_P2_METRIC,
+                  point_col=None, color_map=None, min_n=2, title=""):
+    """Violin + scatter for one subplot.  Returns n-string for title."""
+    _sub = df_sub[df_sub["cell_type"].isin(group_order)].dropna(subset=[metric])
+    _gs  = [g for g in group_order if (_sub["cell_type"] == g).sum() >= min_n]
+    if not _gs:
+        ax.text(0.5, 0.5, "no data (n<2)", ha="center", va="center",
+                transform=ax.transAxes, fontsize=9, color="gray")
+        ax.set_title(title, fontsize=8)
+        return ""
+
+    # Gray violin per group
+    _valid = [(i, _sub[_sub["cell_type"] == g][metric].values)
+              for i, g in enumerate(_gs)
+              if len(_sub[_sub["cell_type"] == g]) >= min_n]
+    if _valid:
+        _pts = ax.violinplot([v for _, v in _valid],
+                             positions=[i for i, _ in _valid],
+                             showmedians=True, showextrema=True)
+        for _pc in _pts["bodies"]:
+            _pc.set_facecolor("0.82"); _pc.set_alpha(0.55)
+        for _k in ("cmedians", "cbars", "cmins", "cmaxes"):
+            if _k in _pts:
+                _pts[_k].set_color("0.4"); _pts[_k].set_linewidth(1.2)
+
+    # Scatter points
+    _rng = np.random.default_rng(seed=42)
+    for _j, _g in enumerate(_gs):
+        _grp = _sub[_sub["cell_type"] == _g]
+        if point_col and color_map:
+            for _cat, _col in color_map.items():
+                _sv = _grp[_grp[point_col] == _cat][metric].values
+                if len(_sv) == 0:
+                    continue
+                ax.scatter(_j + _rng.uniform(-0.08, 0.08, len(_sv)),
+                           _sv, s=20, color=_col, alpha=0.85, zorder=4)
+        else:
+            _sv = _grp[metric].values
+            _col = ct_color.get(_g, "steelblue")
+            ax.scatter(_j + _rng.uniform(-0.08, 0.08, len(_sv)),
+                       _sv, s=20, color=_col, alpha=0.85, zorder=4)
+
+    ax.set_xticks(range(len(_gs)))
+    ax.set_xticklabels(_gs, fontsize=9)
+    ax.set_title(title, fontsize=8)
+    return "  ".join(f"{g}:{(_sub['cell_type'] == g).sum()}" for g in _gs)
+
+
+# %%
+# -- Figure 1: form fixation, all colony annotations ----------------------
+#   Layout: rows = fixation duration (10min / 20min / combined)
+#           cols = emission channel
+
+_dur_sets_1 = [
+    ("form 10 min",   df_analysis[_M_FORM_10]),
+    ("form 20 min",   df_analysis[_M_FORM_20]),
+    ("form combined", df_analysis[_M_FORM_ALL]),
+]
+_nrows_1 = len(_dur_sets_1)
+_ncols_1 = len(_P2_CHANNELS)
+
+_fig1, _axes1 = plt.subplots(_nrows_1, _ncols_1,
+                              figsize=(4*_ncols_1, 4*_nrows_1),
+                              squeeze=False, sharey=True)
+
+for _ri1, (_dur_lbl, _df_dur) in enumerate(_dur_sets_1):
+    for _ci1, _ch1 in enumerate(_P2_CHANNELS):
+        _ax1 = _axes1[_ri1][_ci1]
+        _df_ch = _df_dur[_df_dur["em_filter_nm"] == _ch1]
+        _ns1 = _p2_amp_panel(
+            _ax1, _df_ch, _P2_CT,
+            point_col="_colony_cat", color_map=_CAT_COLORS,
+            title=f"{_dur_lbl}  /  {int(_ch1)} nm",
+        )
+        if _ns1:
+            _ax1.set_title(f"{_dur_lbl}  /  {int(_ch1)} nm\nn={_ns1}", fontsize=8)
+        if _ci1 == 0:
+            _ax1.set_ylabel("amp ratio (median)")
+
+_leg1 = [mpatches.Patch(color=v, label=k) for k, v in _CAT_COLORS.items()]
+_fig1.legend(handles=_leg1, title="colony region", fontsize=8,
+             loc="upper right", bbox_to_anchor=(1.13, 0.98))
+_fig1.suptitle("amp ratio  --  form fixation  (shift=0, 2-comp)",
+               fontsize=11)
+plt.tight_layout()
+_savefig(_fig1, "fig_amp_form_colony_color")
+plt.show()
+
+
+# %%
+# -- Figure 2: live, all colony annotations --------------------------------
+#   Layout: 1 row x 2 cols (channels)
+
+_nrows_2 = 1
+_ncols_2 = len(_P2_CHANNELS)
+
+_fig2, _axes2 = plt.subplots(_nrows_2, _ncols_2,
+                              figsize=(4*_ncols_2, 4.5),
+                              squeeze=False, sharey=True)
+
+for _ci2, _ch2 in enumerate(_P2_CHANNELS):
+    _ax2  = _axes2[0][_ci2]
+    _df_ch2 = df_analysis[_M_LIVE_ALL & (df_analysis["em_filter_nm"] == _ch2)]
+    _ns2 = _p2_amp_panel(
+        _ax2, _df_ch2, _P2_CT,
+        point_col="_colony_cat", color_map=_CAT_COLORS,
+        title=f"live  /  {int(_ch2)} nm",
+    )
+    if _ns2:
+        _ax2.set_title(f"live  /  {int(_ch2)} nm\nn={_ns2}", fontsize=8)
+    if _ci2 == 0:
+        _ax2.set_ylabel("amp ratio (median)")
+
+_leg2 = [mpatches.Patch(color=v, label=k) for k, v in _CAT_COLORS.items()]
+_fig2.legend(handles=_leg2, title="colony region", fontsize=8,
+             loc="upper right", bbox_to_anchor=(1.13, 0.98))
+_fig2.suptitle("amp ratio  --  live  (shift=0, 2-comp)", fontsize=11)
+plt.tight_layout()
+_savefig(_fig2, "fig_amp_live_colony_color")
+plt.show()
+
+
+# %%
+# -- Figure 3: form fixation, colony_deep only -----------------------------
+#   Layout: rows = fixation duration (10min / 20min)
+#           cols = emission channel
+#   No combined panel (10min and 20min are compared separately for deep cells)
+
+_dur_sets_3 = [
+    ("form 10 min, deep", df_analysis[_M_FORM_10 & _M_DEEP]),
+    ("form 20 min, deep", df_analysis[_M_FORM_20 & _M_DEEP]),
+]
+_nrows_3 = len(_dur_sets_3)
+_ncols_3 = len(_P2_CHANNELS)
+
+_fig3, _axes3 = plt.subplots(_nrows_3, _ncols_3,
+                              figsize=(4*_ncols_3, 4*_nrows_3),
+                              squeeze=False, sharey=True)
+
+for _ri3, (_dur_lbl, _df_dur) in enumerate(_dur_sets_3):
+    for _ci3, _ch3 in enumerate(_P2_CHANNELS):
+        _ax3 = _axes3[_ri3][_ci3]
+        _df_ch3 = _df_dur[_df_dur["em_filter_nm"] == _ch3]
+        _ns3 = _p2_amp_panel(
+            _ax3, _df_ch3, _P2_CT,
+            point_col=None, color_map=None,   # cell_type colors, no colony overlay
+            title=f"{_dur_lbl}  /  {int(_ch3)} nm",
+        )
+        if _ns3:
+            _ax3.set_title(f"{_dur_lbl}  /  {int(_ch3)} nm\nn={_ns3}", fontsize=8)
+        if _ci3 == 0:
+            _ax3.set_ylabel("amp ratio (median)")
+
+# Cell-type legend
+_leg3 = [mpatches.Patch(color=ct_color.get(c, "gray"), label=c) for c in _P2_CT]
+_fig3.legend(handles=_leg3, title="cell type", fontsize=8,
+             loc="upper right", bbox_to_anchor=(1.12, 0.98))
+_fig3.suptitle("amp ratio  --  form fixation, colony_deep only  (shift=0, 2-comp)",
+               fontsize=11)
+plt.tight_layout()
+_savefig(_fig3, "fig_amp_form_deep_only")
+plt.show()
+
+
+# %%
+# -- Figure 4: live, colony_deep only --------------------------------------
+#   Layout: 1 row x 2 cols (channels)
+
+_nrows_4 = 1
+_ncols_4 = len(_P2_CHANNELS)
+
+_fig4, _axes4 = plt.subplots(_nrows_4, _ncols_4,
+                              figsize=(4*_ncols_4, 4.5),
+                              squeeze=False, sharey=True)
+
+for _ci4, _ch4 in enumerate(_P2_CHANNELS):
+    _ax4 = _axes4[0][_ci4]
+    _df_ch4 = df_analysis[_M_LIVE_ALL & _M_DEEP & (df_analysis["em_filter_nm"] == _ch4)]
+    _ns4 = _p2_amp_panel(
+        _ax4, _df_ch4, _P2_CT,
+        point_col=None, color_map=None,
+        title=f"live, deep only  /  {int(_ch4)} nm",
+    )
+    if _ns4:
+        _ax4.set_title(f"live, deep  /  {int(_ch4)} nm\nn={_ns4}", fontsize=8)
+    if _ci4 == 0:
+        _ax4.set_ylabel("amp ratio (median)")
+
+_leg4 = [mpatches.Patch(color=ct_color.get(c, "gray"), label=c) for c in _P2_CT]
+_fig4.legend(handles=_leg4, title="cell type", fontsize=8,
+             loc="upper right", bbox_to_anchor=(1.12, 0.98))
+_fig4.suptitle("amp ratio  --  live, colony_deep only  (shift=0, 2-comp)",
+               fontsize=11)
+plt.tight_layout()
+_savefig(_fig4, "fig_amp_live_deep_only")
+plt.show()
+
+# %%
+import winsound as _ws, time as _t
+for _ in range(3):
+    _ws.Beep(1000, 400)
+    _t.sleep(1)

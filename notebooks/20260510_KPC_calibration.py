@@ -847,3 +847,9 @@ print(f"Saved chroma calibration table to {results_dir / 'chroma_calibration.csv
 # - `phasor_apply_cal(G, S, phase_corr, mod_corr)`: apply to any phasor array
 #
 # **Next:** Phase C (data integrity checks) or Phase D (phasor analysis per sample)
+
+# %%
+import winsound as _ws, time as _t
+for _ in range(3):
+    _ws.Beep(1000, 400)
+    _t.sleep(1)

@@ -56,6 +56,11 @@ ORIENTATION_TRANSFORM = None    # confirmed in Step 8: SDT and SPCImage raw are 
 #   form/live: 2-component (standard free/bound NADH)
 PREFERRED_N_COMP = {"glu": 3, "form": 2, "live": 2}
 
+# Per-session bin-radius override.  See Phase E for rationale.
+PREFERRED_BIN_OVERRIDE = {
+    "20260509_KPC_fixed_dishes_on_SLIM": 10,
+}
+
 # Amplitude ratio definition per fixation type:
 #   glu:       a2/(a2+a3)  -- skip ultra-short artifact component a1 (~16 ps)
 #   form/live: a1/(a1+a2)  -- standard free/total NADH ratio
@@ -251,6 +256,13 @@ for _sample_key in list(fit_data.keys())[:3]:
     print(f"    params: {_plist}")
 
 # Helper: select best fit_set_key for a file using fit_map_df + PREFERRED_N_COMP
+def _parse_bin_radius(key: str) -> int:
+    """Parse bin radius from fit_set_key string, e.g. 'fitet-sz-c2-b10' -> 10.
+    Returns 0 if no bin token found."""
+    m = re.search(r"[-_]b(\d+)", str(key), re.IGNORECASE)
+    return int(m.group(1)) if m else 0
+
+
 def _prefer_shift_zero(candidates) -> str:
     """Among candidate rows, return the fit_set_key of the shift-zero folder.
 
@@ -270,6 +282,9 @@ def best_fit_key(filename: str, fixation_type: str = None) -> str | None:
     """Return the preferred fit_set_key for a file.
 
     Selection priority:
+      0. If the session has a PREFERRED_BIN_OVERRIDE entry, restrict candidates
+         to that bin radius before any other selection.  Falls through if the
+         preferred bin has no matching fit set for this file.
       1. Match PREFERRED_N_COMP[fixation_type]; among ties prefer shift-zero folder.
       2. Else: highest n_components; among ties prefer shift-zero folder.
       3. Else: first row.
@@ -277,6 +292,14 @@ def best_fit_key(filename: str, fixation_type: str = None) -> str | None:
     rows = fit_map_df[fit_map_df["sdt_filename"] == filename]
     if rows.empty:
         return None
+    # Apply per-session bin override (explicit re-export at higher bin)
+    if PREFERRED_BIN_OVERRIDE:
+        _sess = str(rows.iloc[0]["fit_set_key"]).split("::")[0]
+        if _sess in PREFERRED_BIN_OVERRIDE:
+            _bin_rows = rows[rows["fit_set_key"].apply(_parse_bin_radius)
+                            == PREFERRED_BIN_OVERRIDE[_sess]]
+            if not _bin_rows.empty:
+                rows = _bin_rows
     preferred = PREFERRED_N_COMP.get(str(fixation_type)) if fixation_type else None
     if preferred is not None and "n_components" in rows.columns:
         exact = rows[rows["n_components"] == preferred]
@@ -1133,3 +1156,9 @@ else:
 #   2. Thresholding (intensity mask per image) is Step 9 of Phase D
 
 # %%
+
+# %%
+import winsound as _ws, time as _t
+for _ in range(3):
+    _ws.Beep(1000, 400)
+    _t.sleep(1)

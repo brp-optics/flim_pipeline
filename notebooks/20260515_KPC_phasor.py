@@ -800,3 +800,9 @@ else:
 #   1. Verify tau_phi_ns and tau_mod_ns are in expected NADH range (~0.5-3 ns)
 #   2. Check that phasor cloud sits on or inside the universal semicircle
 #   3. If a2/tau2/a3/tau3 have been re-exported from SPCImage, re-run Phase A -> C
+
+# %%
+import winsound as _ws, time as _t
+for _ in range(3):
+    _ws.Beep(1000, 400)
+    _t.sleep(1)
