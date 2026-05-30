@@ -875,4 +875,68 @@ plt.tight_layout()
 plt.savefig(r'..\results\quickpeek3_permutation.png', dpi=200, bbox_inches='tight')
 plt.show()
 
+# %% [markdown]
+# ## Step 12: Live-session sensitivity (drop 5/1 KPC and 5/21 BKO)
+#
+# Justification for the restriction: Pockels is a significant factor for live
+# tau_mean and for form 10min tau_mean and a1/a2 (Step 11 forest plots).
+# - 5/1 KPC was acquired at Pockels=0.1
+# - 5/21 BKO was acquired at Pockels=0.25
+# - 5/8 KPC and 5/17 BKO were both at Pockels=0.2  -- best match.
+#
+# Forest of (KPCWT - BKO) median diff under three restrictions:
+#   primary       = full Low-PC matched subset
+#   drop 5/21 BKO = keep both KPC sessions, drop 5/21 BKO
+#   only 5/8+5/17 = keep only Pockels=0.2 sessions
+
+# %%
+live_base = df.loc[(df.fixation_type == 'live')
+                   & df.em_filter_nm.isin(NADH_FILTERS)
+                   & (df.PC == 'Low')
+                   & (df.annotation == 'colony_deep')]
+
+live_restrictions = {
+    'primary (all Low PC)': live_base,
+    'drop 5/21 BKO':        live_base.loc[live_base.date != pd.Timestamp('2026-05-21')],
+    'only 5/8 + 5/17':      live_base.loc[live_base.date.isin(
+                                [pd.Timestamp('2026-05-08'),
+                                 pd.Timestamp('2026-05-17')])],
+}
+
+fig, axes = plt.subplots(len(METRICS), 1,
+                         figsize=(10, 3.5 * len(METRICS)), squeeze=False)
+for row, (metric, ylabel) in enumerate(METRICS.items()):
+    ax = axes[row][0]
+    items = []
+    for lbl, sub in live_restrictions.items():
+        items.append((lbl, effect_stats(sub, metric)))
+    for i, (lbl, eff) in enumerate(items):
+        if eff is None:
+            ax.text(0.02, i, '(n < 2)', va='center',
+                    transform=ax.get_yaxis_transform(),
+                    fontsize=9, color='gray')
+            continue
+        color = 'black' if (eff['ci_lo'] * eff['ci_hi'] > 0) else 'gray'
+        ax.errorbar([eff['diff']], [i],
+                    xerr=[[eff['diff']-eff['ci_lo']], [eff['ci_hi']-eff['diff']]],
+                    fmt='o', color=color, capsize=4, lw=1.6, markersize=9)
+        sig = ' *' if eff['p'] < 0.05 else ''
+        ax.text(1.02, i,
+                f"n=({eff['n_kpc']},{eff['n_bko']})  "
+                f"r={eff['r']:+.2f}  p={eff['p']:.3f}{sig}",
+                transform=ax.get_yaxis_transform(),
+                fontsize=9, va='center', family='monospace')
+    ax.axvline(0, color='gray', lw=1, linestyle='--')
+    ax.set_yticks(range(len(items)))
+    ax.set_yticklabels([r[0] for r in items])
+    ax.invert_yaxis()
+    ax.set_xlabel(f'KPCWT - BKO median diff: {ylabel}')
+    ax.set_title(ylabel, fontsize=10)
+plt.suptitle('Live: session-restriction sensitivity  |  matched-Pockels subset',
+             fontsize=11, y=1.01)
+plt.tight_layout()
+plt.savefig(r'..\results\quickpeek3_live_session_sensitivity.png',
+            dpi=200, bbox_inches='tight')
+plt.show()
+
 # %%

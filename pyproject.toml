@@ -11,6 +11,8 @@ dependencies = [
     "pyqt5>=5.15.11; sys_platform == 'linux'",
     "scipy>=1.17.1",
     "sdtfile>=2026.2.8",
+    "seaborn>=0.13.2",
+    "statsmodels>=0.14.6",
 ]
 
 [dependency-groups]
