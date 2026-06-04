@@ -255,315 +255,55 @@ if "n_components" in fit_map_df.columns:
     print(fit_map_df["n_components"].value_counts().sort_index().to_string())
 
 # %%
-# -- Helpers: .asc loading --------------------------------------------------
+# -- Helpers: import from src/io.py (was inline) ----------------------------
+import sys as _sys
+_sys.path.insert(0, str(Path("..").resolve()))
+from src.io import (
+    _infer_param_name,
+    _strip_param_suffix,
+    load_asc_fit_set,
+    parse_fit_folder,
+    fit_dir_from_key as _lib_fit_dir_from_key,
+    load_saved_mask as _lib_load_saved_mask,
+)
 
-def _infer_param_name(stem: str) -> str:
-    s = stem.lower()
-    for pattern, name in [
-        (r"[-_]a1[_%]?$",                             "a1"),
-        (r"[-_]a2[_%]?$",                             "a2"),
-        (r"[-_]a3[_%]?$",                             "a3"),
-        (r"[-_]t1$|[-_]tau1$",                        "tau1"),
-        (r"[-_]t2$|[-_]tau2$",                        "tau2"),
-        (r"[-_]t3$|[-_]tau3$",                        "tau3"),
-        (r"[-_]tm$|[-_]tau_?mean$|[-_]mean$",         "tau_mean"),
-        (r"[-_]chi$|[-_]chisq?$",                     "chi2"),
-        (r"[-_]photons?$|[-_]int(ensity)?$|[-_]cnt$", "photons"),
-        (r"[-_]scatter$|[-_]sc$",                     "scatter"),
-        (r"[-_]shift$",                                "shift"),
-        (r"[-_]g$",                                    "G"),
-        (r"[-_]s$",                                    "S"),
-    ]:
-        if re.search(pattern, s):
-            return name
-    parts = s.rsplit("_", 1)
-    return parts[-1] if len(parts) > 1 else s
+# Thin wrappers bake in this notebook's data_dirs so call sites stay 1-arg.
+def fit_dir_from_key(fit_set_key: str):
+    return _lib_fit_dir_from_key(fit_set_key, data_dirs)
+
+def load_saved_mask(fit_set_key: str):
+    return _lib_load_saved_mask(fit_set_key, data_dirs)
 
 
-def _strip_param_suffix(stem: str) -> str:
-    return re.sub(
-        r"[-_]?(a[123]|t[123]|tau[123]|chi|chisq?|photons?|intensity|cnt|"
-        r"tm|tau_?mean|scatter|sc|shift|[gs])[_%]?$",
-        "",
-        stem,
-        flags=re.IGNORECASE,
-    ).strip("_- ")
+# -- Helpers: import from src/fitting.py and src/metrics.py (was inline) ----
+from src.fitting import (
+    _parse_bin_radius,
+    _prefer_shift_zero,
+    best_fit_key as _lib_best_fit_key,
+    compute_fit_mask as _lib_compute_fit_mask,
+)
+from src.metrics import compute_tau_mean as _lib_compute_tau_mean
 
-
-def load_asc_fit_set(fit_dir: Path, base_stem: str) -> dict:
-    """Load all .asc exports for one base stem from a fit folder."""
-    fd = {}
-    for fp in sorted(fit_dir.glob("*.asc")):
-        if re.search(r"_statistic", fp.stem, re.IGNORECASE):
-            continue
-        if _strip_param_suffix(fp.stem).lower() != base_stem.lower():
-            continue
-        param = _infer_param_name(fp.stem)
-        try:
-            data = np.loadtxt(str(fp), dtype=float)
-        except ValueError:
-            try:
-                data = np.loadtxt(str(fp), dtype=float, skiprows=1)
-            except Exception:
-                continue
-        except Exception:
-            continue
-        if data.ndim == 2 and data.size > 0:
-            fd[param] = data
-    return fd
-
-
-# -- Helpers: fit folder / key navigation -----------------------------------
-
-def parse_fit_folder(folder_name: str) -> dict:
-    """Parse BH fit or export folder metadata from the folder name.
-
-    Fit folder examples:
-      'fitet-sz-b2'              -> b=2, shift=zero, n_components=None
-      'fitet-sf-b5-c3'           -> b=5, shift=free, n_components=3
-      'fitet-sz-b2-1component'   -> b=2, shift=zero, n_components=1
-
-    Export folder examples (is_export=True):
-      'exet-fitet-sz-b2'                -> asc exports, b=2, shift=zero
-      'exet600-1400-0-500-fitet-sz-b2'  -> tif exports, color LUT 600-1400 ps,
-                                           intensity LUT 0-500, b=2
-
-    Returns dict with keys:
-      b_val         -- BH bin radius (int, default 1)
-      shift_free    -- True if shift is a free fit parameter
-      kernel_size   -- 2*b_val + 1
-      n_components  -- number of fit components from folder name, or None
-      is_export     -- True if this is an exet export folder
-      export_format -- 'tif', 'asc', or None
-      color_lo/hi   -- tif lifetime colour LUT bounds (ps), or None
-      intensity_lo/hi -- tif intensity LUT bounds, or None
-    """
-    result = {
-        "b_val": 1, "shift_free": False, "kernel_size": 3,
-        "n_components": None, "is_export": False, "export_format": None,
-        "color_lo": None, "color_hi": None,
-        "intensity_lo": None, "intensity_hi": None,
-    }
-
-    name = folder_name
-
-    # Detect export folder: exet{N}-{N}-{N}-{N}-... (tif) or exet-... (asc)
-    m_tif = re.match(r"^exet(\d+)-(\d+)-(\d+)-(\d+)[-_](.+)$", name, re.IGNORECASE)
-    m_asc = re.match(r"^exet[-_](.+)$", name, re.IGNORECASE)
-    if m_tif:
-        result["is_export"]     = True
-        result["export_format"] = "tif"
-        result["color_lo"]      = float(m_tif.group(1))
-        result["color_hi"]      = float(m_tif.group(2))
-        result["intensity_lo"]  = float(m_tif.group(3))
-        result["intensity_hi"]  = float(m_tif.group(4))
-        name = m_tif.group(5)    # remainder: 'fitet-sz-b2'
-    elif m_asc:
-        result["is_export"]     = True
-        result["export_format"] = "asc"
-        name = m_asc.group(1)    # remainder: 'fitet-sz-b2'
-
-    # b value
-    m_b = re.search(r"(?:^|[-_])b(\d+)", name, re.IGNORECASE)
-    if m_b:
-        b = int(m_b.group(1))
-        result["b_val"]       = b
-        result["kernel_size"] = 2 * b + 1
-
-    # shift type: sz = zero (fixed), sf = free
-    m_s = re.search(r"(?:^|[-_])s([zf])(?=[-_]|$)", name, re.IGNORECASE)
-    if m_s:
-        result["shift_free"] = m_s.group(1).lower() == "f"
-
-    # n_components: 'c1'/'c2'/'c3' or '1component'/'2component'/'3component'
-    m_c = re.search(r"(?:^|[-_])c(\d+)(?:omponents?)?(?=[-_]|$)", name, re.IGNORECASE)
-    if not m_c:
-        m_c = re.search(r"(?:^|[-_])(\d+)components?(?=[-_]|$)", name, re.IGNORECASE)
-    if m_c:
-        result["n_components"] = int(m_c.group(1))
-
-    return result
-
-
-def fit_dir_from_key(fit_set_key: str) -> tuple:
-    """Return (fit_dir, session_root, rel_dir, base_stem) for a fit_set_key.
-
-    fit_dir is None if the session directory is not found in data_dirs.
-    """
-    session_root, rel_dir, base_stem = fit_set_key.split("::", 2)
-    session_dir = next((d for d in data_dirs if d.name == session_root), None)
-    fit_dir = (session_dir / Path(rel_dir)) if session_dir else None
-    return fit_dir, session_root, rel_dir, base_stem
-
-
-def load_saved_mask(fit_set_key: str) -> np.ndarray | None:
-    """Load the .npy quality mask saved by Step 15, or None if missing."""
-    fit_dir, _, _, base_stem = fit_dir_from_key(fit_set_key)
-    if fit_dir is None:
-        return None
-    p = fit_dir / f"{base_stem}_fit_mask.npy"
-    return np.load(str(p)) if p.exists() else None
-
-
-def _parse_bin_radius(key: str) -> int:
-    """Parse bin radius from fit_set_key string, e.g. 'fitet-sz-c2-b10' -> 10.
-    Returns 0 if no bin token found."""
-    m = re.search(r"[-_]b(\d+)", str(key), re.IGNORECASE)
-    return int(m.group(1)) if m else 0
-
-
-def _prefer_shift_zero(candidates) -> str:
-    """Among candidate rows, return the fit_set_key of the shift-zero folder.
-
-    Prefers rows whose key contains '-sz-' (SPCImage shift=zero) over '-sf-'
-    (shift=free).  Falls back to the first row if no '-sz-' match exists.
-    """
-    sz_rows = candidates[candidates["fit_set_key"].str.contains("-sz-", case=False, na=False)]
-    chosen  = sz_rows if not sz_rows.empty else candidates
-    return str(chosen.iloc[0]["fit_set_key"])
-
-
-def best_fit_key(filename: str, fixation_type: str = None) -> str | None:
-    """Return the highest-bin fit_set_key matching the hard constraints:
-       n_components == PREFERRED_N_COMP[fixation_type]  AND  shift-zero folder.
-    Returns None if no fit satisfies both constraints.
-    """
-    rows = fit_map_df[fit_map_df["sdt_filename"] == filename]
-    if rows.empty:
-        return None
-    # Hard constraint: n_components
-    preferred = PREFERRED_N_COMP.get(str(fixation_type)) if fixation_type else None
-    if preferred is not None and "n_components" in rows.columns:
-        rows = rows[rows["n_components"] == preferred]
-        if rows.empty:
-            return None
-    # Hard constraint: shift-zero (sz folder)
-    rows = rows[rows["fit_set_key"].str.contains("-sz-", case=False, na=False)]
-    if rows.empty:
-        return None
-    # Among survivors, pick the highest bin
-    rows = rows.assign(_bin=rows["fit_set_key"].apply(_parse_bin_radius))
-    return str(rows.sort_values("_bin", ascending=False).iloc[0]["fit_set_key"])
-
-
-# -- Helpers: masking and analysis ------------------------------------------
-
-def compute_fit_mask(
-    fd: dict,
-    fixation_type: str,
-    b_val: int,
-    sdt_photons: np.ndarray | None = None,
-    n_components: int | None = None,
-) -> tuple:
-    """Combine four quality criteria into a single boolean mask.
-
-    Criteria applied in order:
-      1. Box-kernel smoothed photon count >= MIN_PHOTONS_SMOOTHED
-      2. Chi^2 in [CHI2_LO, CHI2_HI]
-      3. All amplitude components >= 0 and their sum > 0
-      4. Tau values within TAU_BOUNDS[fixation_type] (ps)
-
-    Returns (mask_final, breakdown_dict).
-    """
-    shape = next(
-        (v.shape for v in fd.values() if isinstance(v, np.ndarray) and v.ndim == 2),
-        None,
+# Thin wrappers bake in this notebook's config dicts so call sites stay unchanged.
+def best_fit_key(filename, fixation_type=None):
+    return _lib_best_fit_key(
+        filename, fit_map_df,
+        fixation_type=fixation_type,
+        preferred_n_comp=PREFERRED_N_COMP,
     )
-    if shape is None:
-        return np.zeros((1, 1), dtype=bool), {}
 
-    n_total = shape[0] * shape[1]
+def compute_fit_mask(fd, fixation_type, b_val, sdt_photons=None, n_components=None):
+    return _lib_compute_fit_mask(
+        fd, fixation_type, b_val, sdt_photons, n_components,
+        min_photons_by_ncomp=MIN_PHOTONS_BY_NCOMP,
+        chi2_lo=CHI2_LO, chi2_hi=CHI2_HI,
+        tau_bounds=TAU_BOUNDS,
+        tau_mean_bounds=TAU_MEAN_BOUNDS,
+        taumean_cfg=TAUMEAN_CFG,
+    )
 
-    # 1. Photon count -- SPCImage sums the (2b+1)^2 neighbourhood before fitting
-    # but exports original per-pixel intensities in _photons.asc.
-    # Multiply the local average by the kernel area to recover the binned total,
-    # then compare against the per-component threshold.
-    min_ph     = MIN_PHOTONS_BY_NCOMP.get(n_components, MIN_PHOTONS_BY_NCOMP[None])
-    photon_src = fd.get("photons") if "photons" in fd else sdt_photons
-    if photon_src is not None and photon_src.shape == shape:
-        kernel_area = (2 * b_val + 1) ** 2
-        smoothed    = uniform_filter(photon_src.astype(float), size=2 * b_val + 1)
-        mask_photon = smoothed * kernel_area >= min_ph
-    else:
-        mask_photon = np.ones(shape, dtype=bool)    # no photon data -- pass all
-
-    # 2. Chi^2 bounds
-    chi2 = fd.get("chi2")
-    if chi2 is not None and chi2.shape == shape:
-        mask_chi2 = np.isfinite(chi2) & (chi2 >= CHI2_LO) & (chi2 <= CHI2_HI)
-    else:
-        mask_chi2 = np.ones(shape, dtype=bool)
-
-    # 3. Amplitude positivity + non-zero sum (catches SPCImage zero-fill on failed fits)
-    amp_names = [p for p in ("a1", "a2", "a3") if p in fd and fd[p].shape == shape]
-    if amp_names:
-        mask_amp = np.ones(shape, dtype=bool)
-        for p in amp_names:
-            mask_amp &= fd[p] >= 0.0
-        mask_amp &= sum(fd[p] for p in amp_names) > 0.0
-    else:
-        mask_amp = np.ones(shape, dtype=bool)
-
-    # 4. Tau physical bounds (ps)
-    tau_cfg  = TAU_BOUNDS.get(fixation_type, {})
-    mask_tau = np.ones(shape, dtype=bool)
-    for param, (lo, hi) in tau_cfg.items():
-        if param in fd and fd[param].shape == shape:
-            arr = fd[param]
-            mask_tau &= np.isfinite(arr) & (arr >= lo) & (arr <= hi)
-
-    # 5. Amplitude-weighted tau_mean bounds (catches punctate low/high-tau artifacts)
-    taumean_cfg = TAU_MEAN_BOUNDS.get(fixation_type)
-    if taumean_cfg is not None:
-        tau_m = compute_tau_mean(fd, fixation_type)
-        if tau_m is not None and tau_m.shape == shape:
-            lo_tm, hi_tm = taumean_cfg
-            mask_taumean = np.isfinite(tau_m)
-            if lo_tm is not None:
-                mask_taumean &= tau_m >= lo_tm
-            if hi_tm is not None:
-                mask_taumean &= tau_m <= hi_tm
-        else:
-            mask_taumean = np.ones(shape, dtype=bool)
-    else:
-        mask_taumean = np.ones(shape, dtype=bool)
-
-    mask_final = mask_photon & mask_chi2 & mask_amp & mask_tau & mask_taumean
-
-    breakdown = {
-        "n_total":       n_total,
-        "n_photon_ok":   int(mask_photon.sum()),
-        "n_chi2_ok":     int(mask_chi2.sum()),
-        "n_amp_ok":      int(mask_amp.sum()),
-        "n_tau_ok":      int(mask_tau.sum()),
-        "n_taumean_ok":  int(mask_taumean.sum()),
-        "n_final":       int(mask_final.sum()),
-        "pct_final":     round(100.0 * mask_final.sum() / n_total, 1),
-    }
-    return mask_final, breakdown
-
-
-def compute_tau_mean(fd: dict, fixation_type: str) -> np.ndarray | None:
-    """Compute amplitude-weighted tau_mean (ps) from fit arrays.
-
-    Returns a 2-D array in the same units as the tau exports (ps from SPCImage),
-    or None if the required parameters are absent.
-    """
-    components = TAUMEAN_CFG.get(fixation_type)
-    if components is None:
-        return None
-    if any(a not in fd or t not in fd for a, t in components):
-        return None
-    a_arrs   = [fd[a] for a, _ in components]
-    tau_arrs = [fd[t] for _, t in components]
-    a_sum    = sum(a_arrs)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        tau_m = np.where(
-            a_sum > 0,
-            sum(a * t for a, t in zip(a_arrs, tau_arrs)) / a_sum,
-            np.nan,
-        )
-    return tau_m
+def compute_tau_mean(fd, fixation_type):
+    return _lib_compute_tau_mean(fd, fixation_type, taumean_cfg=TAUMEAN_CFG)
 
 # %% [markdown]
 # ## Step 15: Quality masking -- all fit sets
@@ -1164,6 +904,24 @@ if not fit_analysis_df.empty:
 
 fit_analysis_df.to_csv(results_dir / "fit_analysis_summary.csv", index=False)
 print(f"\nSaved: {results_dir / 'fit_analysis_summary.csv'}")
+
+# %% [markdown]
+# ## Snapshot for regression testing
+#
+# When the env var FLIM_SNAPSHOT is set, dump key intermediate DataFrames
+# to tests/snapshots/.  Used by tests/compare_outputs.py to catch regressions
+# during the notebook -> library refactor.  No-op during normal interactive use.
+
+# %%
+import os as _os
+if _os.environ.get("FLIM_SNAPSHOT"):
+    _snap_dir = Path(__file__).resolve().parent.parent / "tests" / "snapshots" \
+        if "__file__" in dir() else Path("../tests/snapshots")
+    _snap_dir.mkdir(parents=True, exist_ok=True)
+    mask_summary_df.to_pickle(_snap_dir / "phaseE_mask_summary_df.pkl")
+    fit_analysis_df.to_pickle(_snap_dir / "phaseE_fit_analysis_df.pkl")
+    print(f"FLIM_SNAPSHOT: wrote phaseE_mask_summary_df.pkl, "
+          f"phaseE_fit_analysis_df.pkl to {_snap_dir}")
 
 # %% [markdown]
 # ## Summary

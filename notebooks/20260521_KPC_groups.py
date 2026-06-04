@@ -505,6 +505,16 @@ for _ft in FIXATION_ORDER:
 fix_present = [f for f in FIXATION_ORDER  if f in df_analysis["fixation_type"].dropna().unique()]
 ct_present  = [c for c in CELL_TYPE_ORDER if c in df_analysis["cell_type"].dropna().unique()]
 
+# -- Snapshot for regression testing -----------------------------------------
+# When FLIM_SNAPSHOT is set, dump df and df_analysis to tests/snapshots/.
+# Used by tests/compare_outputs.py during the notebook -> library refactor.
+import os as _os
+if _os.environ.get("FLIM_SNAPSHOT"):
+    _snap = Path("../tests/snapshots"); _snap.mkdir(parents=True, exist_ok=True)
+    df.to_pickle(_snap / "phaseF_df.pkl")
+    df_analysis.to_pickle(_snap / "phaseF_df_analysis.pkl")
+    print(f"FLIM_SNAPSHOT: wrote phaseF_df.pkl, phaseF_df_analysis.pkl to {_snap}")
+
 # %%
 # -- Step 19c: Numeric group summary ----------------------------------------
 #
@@ -944,34 +954,10 @@ for _m21c in all_metrics:
 # Sign: positive r means group_a tends to be larger than group_b.
 
 # %%
-def benjamini_hochberg(pvals: list) -> np.ndarray:
-    """Return BH-corrected q-values for a list of p-values."""
-    p = np.asarray(pvals, dtype=float)
-    n = len(p)
-    if n == 0:
-        return p
-    order = np.argsort(p)
-    rank  = np.empty(n, dtype=int)
-    rank[order] = np.arange(1, n + 1)
-    q = np.minimum(1.0, p * n / rank)
-    # Enforce monotonicity from largest to smallest p
-    for i in range(n - 2, -1, -1):
-        q[order[i]] = min(q[order[i]], q[order[i + 1]])
-    return q
-
-
-def rank_biserial_r(x: np.ndarray, y: np.ndarray) -> float:
-    """Rank-biserial correlation as effect size for Mann-Whitney U.
-
-    r = 2U/(n1*n2) - 1.
-    Positive r means x (group_a) tends to be LARGER than y (group_b).
-    U is the statistic for x vs y (scipy returns U for x).
-    """
-    n1, n2 = len(x), len(y)
-    if n1 == 0 or n2 == 0:
-        return np.nan
-    U = stats.mannwhitneyu(x, y, alternative="two-sided").statistic
-    return float(2.0 * U / (n1 * n2) - 1.0)
+# -- benjamini_hochberg + rank_biserial_r migrated to src/metrics.py --------
+import sys as _sys_phaseF
+_sys_phaseF.path.insert(0, str(Path("..").resolve()))
+from src.metrics import benjamini_hochberg, rank_biserial_r
 
 
 stat_rows = []

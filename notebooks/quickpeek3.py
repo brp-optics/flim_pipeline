@@ -78,31 +78,10 @@ print('\nLIVE:'); print(LIVE.groupby(['date', 'cell_type']).size())
 
 
 # %%
-def show_photons(subset, ncols=4, title=''):
-    n = len(subset)
-    if n == 0:
-        print(f'(empty: {title})'); return
-    nrows = -(-n // ncols)
-    plt.figure(figsize=(5.5*ncols, 4.5*nrows))
-    for i, (_, row) in enumerate(subset.iterrows()):
-        print(row.fit_mask_path)
-        ph_path = row.fit_mask_path.replace('_fit_mask.npy', '_photons.asc')
-        ax = plt.subplot(nrows, ncols, i+1)
-        try:
-            ph = np.loadtxt(ph_path)
-            finite = ph[ph > 0]
-            vlo = float(np.percentile(finite, 1))  if finite.size else 0.0
-            vhi = float(np.percentile(finite, 99)) if finite.size else 1.0
-            plt.imshow(ph, cmap='inferno', vmin=vlo, vmax=vhi)
-            plt.colorbar(fraction=0.046, pad=0.04)
-        except Exception:
-            plt.text(0.5, 0.5, 'no .asc', ha='center', transform=ax.transAxes)
-        wrapped = '\n'.join(textwrap.wrap(row.filename, width=55))
-        plt.title(f"{row.cell_type} {row.date.strftime('%m-%d')}\n{wrapped}", fontsize=7)
-        plt.axis('off')
-    plt.suptitle(title, fontsize=12)
-    plt.tight_layout()
-    plt.show()
+# show_photons migrated to utils/helpers.py
+import sys as _sys_helpers_qp3
+_sys_helpers_qp3.path.insert(0, str(Path("..").resolve()))
+from utils.helpers import show_photons_grid as show_photons
 
 show_photons(FORM, title='FORM colony_deep, 457nm, Low PC')
 show_photons(LIVE, title='LIVE 457nm, Low PC')
@@ -153,31 +132,8 @@ def load_all(mask_path):
     arrs['a1/a2'] = np.where(arrs['a2'] > 0, arrs['a1']/arrs['a2'], np.nan)
     return arrs, stem
 
-def show_row(ax_row, arrs):
-    mask = arrs['mask']
-    panels = [('photons','inferno'), ('tau_mean','RdBu_r'),
-              ('a1','viridis'), ('a2','viridis'),
-              ('a1/a2','RdBu_r'), ('chi2','viridis')]
-    for ax, (key, cmap_name) in zip(ax_row[:6], panels):
-        arr = arrs[key]
-        # photons shown raw; everything else masked so rejected px are hidden
-        display = arr if key == 'photons' else np.where(mask, arr, np.nan)
-        cmap = plt.get_cmap(cmap_name).copy()
-        cmap.set_bad('lightgray')
-        finite = display[np.isfinite(display)]
-        vlo = float(np.percentile(finite, 1))  if finite.size else 0.0
-        vhi = float(np.percentile(finite, 99)) if finite.size else 1.0
-        im = ax.imshow(display, cmap=cmap, vmin=vlo, vmax=vhi)
-        inside = arr[mask & np.isfinite(arr)]
-        i_m = float(inside.mean()) if inside.size else float('nan')
-        ax.set_title(f'{key}\n{i_m:.2f}', fontsize=8)
-        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        ax.axis('off')
-    ax = ax_row[6]
-    im = ax.imshow(mask.astype(float), cmap='gray_r', vmin=0, vmax=1)
-    ax.set_title(f'mask\n{int(mask.sum())} px ({100*mask.mean():.0f}%)', fontsize=8)
-    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    ax.axis('off')
+# show_row migrated to utils/helpers.show_image_row (identical defaults).
+from utils.helpers import show_image_row as show_row
 
 fig, axes = plt.subplots(8, 7, figsize=(28, 28))
 fig.subplots_adjust(hspace=0.6, wspace=0.35, left=0.08)
@@ -303,6 +259,16 @@ for label, sub in subsets.items():
     print(f'\n{label}: n={len(sub)}')
     print(sub.groupby(['cell_type', 'date']).size())
 
+# Snapshot for regression testing during the notebook -> library refactor.
+# No-op unless FLIM_SNAPSHOT env var is set.
+import os as _os
+if _os.environ.get("FLIM_SNAPSHOT"):
+    _snap = Path("../tests/snapshots"); _snap.mkdir(parents=True, exist_ok=True)
+    subsets['form 10min'].to_pickle(_snap / "quickpeek3_form10min.pkl")
+    subsets['live'].to_pickle(_snap / "quickpeek3_live.pkl")
+    print(f"FLIM_SNAPSHOT: wrote quickpeek3_form10min.pkl, "
+          f"quickpeek3_live.pkl to {_snap}")
+
 # %%
 METRICS = {
     'tau_mean_median_ps': 'tau_mean (ps)',
@@ -356,31 +322,13 @@ plt.show()
 
 # %%
 _CT_ORDER  = ['KPCWT', 'BKO']
-_set2      = plt.cm.Set2(np.linspace(0, 0.8, max(len(_CT_ORDER), 1)))
-_CT_COLORS = {ct: _set2[i] for i, ct in enumerate(_CT_ORDER)}
+from utils.helpers import set2_palette as _set2_palette, violin_panel as _lib_violin_panel
+_CT_COLORS = _set2_palette(_CT_ORDER)
 
 def violin_panel(ax, sub, metric):
-    """Build one violin+scatter panel.  Returns (cts_here, groups) for overlay use."""
-    cts_here = [ct for ct in _CT_ORDER if (sub.cell_type == ct).sum() >= 2]
-    groups   = [sub.loc[sub.cell_type == ct, metric].dropna().values for ct in cts_here]
-    colors   = [_CT_COLORS[ct] for ct in cts_here]
-    if not groups:
-        ax.text(0.5, 0.5, 'no data', ha='center', va='center', transform=ax.transAxes)
-        return cts_here, groups
-    parts = ax.violinplot(groups, positions=range(len(groups)),
-                          showmedians=True, showextrema=True)
-    for pc, c in zip(parts['bodies'], colors):
-        pc.set_facecolor(c); pc.set_alpha(0.65)
-    for key in ('cmedians', 'cbars', 'cmins', 'cmaxes'):
-        if key in parts:
-            parts[key].set_color('k'); parts[key].set_linewidth(1.2)
-    rng = np.random.default_rng(0)
-    for j, (grp, c) in enumerate(zip(groups, colors)):
-        jitter = rng.uniform(-0.07, 0.07, len(grp))
-        ax.scatter(j + jitter, grp, s=22, color=c, alpha=0.7, zorder=3, edgecolors='none')
-    ax.set_xticks(range(len(cts_here)))
-    ax.set_xticklabels(cts_here, fontsize=10)
-    return cts_here, groups
+    """Wrapper: bind quickpeek3's cell-type order + Set2 palette."""
+    return _lib_violin_panel(ax, sub, metric,
+                              ct_order=_CT_ORDER, ct_colors=_CT_COLORS)
 
 fig, axes = plt.subplots(len(METRICS), len(subsets), figsize=(9, 8))
 for col, (label, sub) in enumerate(subsets.items()):
@@ -749,25 +697,19 @@ plt.show()
 # quantitatively: if half-width >> effect, the slice is too small / too noisy.
 
 # %%
-from scipy.stats import mannwhitneyu
+# effect_stats migrated to src/metrics.py.  Local wrapper preserves the
+# n_kpc/n_bko key names this notebook's downstream code uses.
+import sys as _sys_qp3
+_sys_qp3.path.insert(0, str(Path("..").resolve()))
+from src.metrics import effect_stats as _lib_effect_stats
 
 def effect_stats(sub, metric, n_boot=2000, seed=0):
-    rng  = np.random.default_rng(seed)
-    kpc  = sub.loc[sub.cell_type == 'KPCWT', metric].dropna().to_numpy()
-    bko  = sub.loc[sub.cell_type == 'BKO',   metric].dropna().to_numpy()
-    if len(kpc) < 2 or len(bko) < 2:
+    e = _lib_effect_stats(sub, metric, group_col='cell_type',
+                          group_a='KPCWT', group_b='BKO',
+                          n_boot=n_boot, seed=seed)
+    if e is None:
         return None
-    obs  = float(np.median(kpc) - np.median(bko))
-    boot = np.array([
-        np.median(rng.choice(kpc, len(kpc), replace=True)) -
-        np.median(rng.choice(bko, len(bko), replace=True))
-        for _ in range(n_boot)
-    ])
-    ci_lo, ci_hi = np.percentile(boot, [2.5, 97.5])
-    u, p = mannwhitneyu(kpc, bko, alternative='two-sided')
-    r    = 2 * u / (len(kpc) * len(bko)) - 1   # rank-biserial; +ve = KPC>BKO
-    return dict(diff=obs, ci_lo=float(ci_lo), ci_hi=float(ci_hi),
-                p=float(p), r=float(r), n_kpc=int(len(kpc)), n_bko=int(len(bko)))
+    return {**e, 'n_kpc': e['n_a'], 'n_bko': e['n_b']}
 
 df['pockels_stratum'] = pd.cut(
     df.pockels, bins=[0, 0.2, 0.25, 0.3, 0.5, 1.0],
@@ -829,21 +771,13 @@ plt.show()
 # permutation null distribution is the empirical p-value.
 
 # %%
+# perm_test migrated to src/metrics.py.
+from src.metrics import perm_test as _lib_perm_test
+
 def perm_test(sub, metric, n_perm=2000, seed=0):
-    rng = np.random.default_rng(seed)
-    kpc = sub.loc[sub.cell_type == 'KPCWT', metric].dropna().to_numpy()
-    bko = sub.loc[sub.cell_type == 'BKO',   metric].dropna().to_numpy()
-    if len(kpc) < 2 or len(bko) < 2:
-        return None
-    obs    = float(np.median(kpc) - np.median(bko))
-    pooled = np.concatenate([kpc, bko])
-    n_k    = len(kpc)
-    null   = np.empty(n_perm)
-    for i in range(n_perm):
-        rng.shuffle(pooled)
-        null[i] = np.median(pooled[:n_k]) - np.median(pooled[n_k:])
-    p_emp  = float((np.abs(null) >= abs(obs)).mean())
-    return obs, null, p_emp
+    return _lib_perm_test(sub, metric, group_col='cell_type',
+                          group_a='KPCWT', group_b='BKO',
+                          n_perm=n_perm, seed=seed)
 
 primary = {
     'form 10min': subsets['form 10min'],

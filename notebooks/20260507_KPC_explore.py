@@ -155,20 +155,24 @@ for d in data_dirs:
 # %% [markdown]
 # # Phase A: Data inventory and loading
 #
-# Load all `.sdt` and `.asc` fit-export files from the two acquisition sessions.
+# Load all `.sdt` and `.asc` fit-export files from the acquisition sessions.
 # Build a metadata DataFrame with one row per acquisition, sorted by time.
 #
 # **Data directories:**
 # - `20260429_KPC_fixed_dishes_on_SLIM`
 # - `20260501_KPC_fixed_dishes_on_SLIM`
+# - `20260509_KPC_fixed_dishes_on_SLIM`
+# - `20260508_KPC_live_on_SLIM`
+# - `20260517_KPC_live_on_SLIM`
+# - `20260520_KPC_fixed_dishes_SLIM`
+# - `20260521_KPC_live_SLIM`
+# - `2060522_KPC_fixed_dishes_SLIM`
 #
-# **Filename convention (decoded from first run):**
+# **Filename conventions:**
 # ```
-# {index}_{sample}_{wavelength}nm_{power}mW_{usb}_{pockels}_{objective}_{em_filter}_{gain}_{z}_{pixels}_{mode}_{frames}_{frame_idx}.sdt
+# {index}_{sample}_{ex_wavelength}nm_{ex_power}mW_u{usb}_poc{pockels}_{objective}_{em_filter}_g{gain}_z{zoom}_{pixels}pix_{mode}_{frames}f_{frame_idx}.sdt
+# {index}_{sample}_{ex_wavelength}nm_{ex_power}mW_u{usb}_poc{pockels}_{objective}_{em_filter}_g{gain}_z{zoom}_{pixels}pix_{mode}_{frames}f_{frame_idx}_{variable}.asc
 # ```
-
-# %%
-
 
 # %% [markdown]
 # ## Step 1: Discover all files

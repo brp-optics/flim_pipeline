@@ -168,73 +168,21 @@ print(sample_df.groupby(
 # keeping the top MASK_FALLBACK_FRAC fraction of pixels.
 
 # %%
-def otsu_threshold(img: np.ndarray) -> float:
-    """Return Otsu threshold for a 2-D photon count image."""
-    flat = img[np.isfinite(img) & (img > 0)].ravel()
-    if flat.size < 2:
-        return 0.0
-    counts, edges = np.histogram(flat, bins=256,
-                                 range=(float(flat.min()), float(flat.max())))
-    total = float(counts.sum())
-    if total == 0:
-        return 0.0
-    bin_mid = 0.5 * (edges[:-1] + edges[1:])
-    mu_tot  = float((counts * bin_mid).sum()) / total
-    best_var, best_thr = -1.0, float(edges[0])
-    w0 = sum0 = 0.0
-    for i in range(len(counts)):
-        w0   += counts[i]
-        sum0 += counts[i] * bin_mid[i]
-        if w0 == 0 or w0 == total:
-            continue
-        w1   = total - w0
-        mu0  = sum0 / w0
-        mu1  = (mu_tot * total - sum0) / w1
-        var_b = (w0 / total) * (w1 / total) * (mu0 - mu1) ** 2
-        if var_b > best_var:
-            best_var = var_b
-            best_thr = float(edges[i + 1])
-    return best_thr
+# -- otsu_threshold, intensity_mask, smooth_phasor migrated to src/phasor.py
+import sys as _sys_phaseD
+_sys_phaseD.path.insert(0, str(Path("..").resolve()))
+from src.phasor import (
+    otsu_threshold,
+    intensity_mask as _lib_intensity_mask,
+    smooth_phasor as _lib_smooth_phasor,
+)
 
+def intensity_mask(photon_img, fallback_frac=MASK_FALLBACK_FRAC,
+                   blur_sigma=MASK_BLUR_SIGMA):
+    return _lib_intensity_mask(photon_img, fallback_frac, blur_sigma)
 
-def intensity_mask(photon_img: np.ndarray,
-                   fallback_frac: float = MASK_FALLBACK_FRAC,
-                   blur_sigma: float = MASK_BLUR_SIGMA):
-    """Return (bool mask, threshold).  True = keep pixel.
-
-    Applies a Gaussian blur (sigma=blur_sigma) before Otsu so the threshold
-    follows cell-level structure rather than per-pixel shot noise.
-    Falls back to top-percentile if Otsu keeps <5% or >95% of pixels.
-    """
-    blurred = gaussian_filter(photon_img.astype(float), sigma=blur_sigma)
-    thresh  = otsu_threshold(blurred)
-    mask    = blurred >= thresh
-    frac    = mask.sum() / float(mask.size)
-    if frac < 0.05 or frac > 0.95:
-        lo     = float(np.nanpercentile(
-            blurred[blurred > 0], 100.0 * (1.0 - fallback_frac)
-        ))
-        thresh = lo
-        mask   = blurred >= lo
-    return mask, thresh
-
-
-def smooth_phasor(G_cal: np.ndarray, S_cal: np.ndarray,
-                  photons: np.ndarray,
-                  sigma: float = PHASOR_BLUR_SIGMA) -> tuple:
-    """Photon-weighted Gaussian smoothing of G and S in spatial domain.
-
-    Filters G*photons and photons separately before dividing, which is
-    equivalent to averaging the underlying TCSPC decays over a local
-    neighbourhood.  Returns (G_sm, S_sm) with NaN where photons == 0.
-    """
-    ph     = np.nan_to_num(photons, nan=0.0)
-    G_num  = np.nan_to_num(G_cal * photons, nan=0.0)
-    S_num  = np.nan_to_num(S_cal * photons, nan=0.0)
-    ph_sm  = gaussian_filter(ph,    sigma=sigma)
-    G_sm   = np.where(ph_sm > 0, gaussian_filter(G_num, sigma=sigma) / ph_sm, np.nan)
-    S_sm   = np.where(ph_sm > 0, gaussian_filter(S_num, sigma=sigma) / ph_sm, np.nan)
-    return G_sm, S_sm
+def smooth_phasor(G_cal, S_cal, photons, sigma=PHASOR_BLUR_SIGMA):
+    return _lib_smooth_phasor(G_cal, S_cal, photons, sigma)
 
 
 # -- Demo: show masks for one file per (fixation_type, em_filter_nm) --------
@@ -293,51 +241,15 @@ for _, row in sample_df.sort_values("acquisition_time").iterrows():
 #   tau_mod = sqrt(1/M^2 - 1)  / (omega * 1e-9)    [ns],   M = sqrt(G^2+S^2)
 
 # %%
-def _get_time_ns(sdt_obj, n_bins: int) -> np.ndarray:
-    """Return bin-centre times in nanoseconds for a loaded SdtFile."""
-    t = sdt_obj.times[0].astype(float) * 1e9    # s -> ns
-    if t.size == n_bins + 1:                     # edges -> midpoints
-        return 0.5 * (t[:-1] + t[1:])
-    if t.size == n_bins:
-        return t
-    # Fallback: uniform bins over 12.5 ns
-    dt = 12.5 / n_bins
-    return np.arange(n_bins) * dt + 0.5 * dt
+# -- _get_time_ns, compute_phasor_raw, apply_phasor_cal migrated --
+from src.phasor import (
+    get_time_ns as _get_time_ns,
+    compute_phasor_raw as _lib_compute_phasor_raw,
+    apply_phasor_cal,
+)
 
-
-def compute_phasor_raw(decay: np.ndarray,
-                       time_ns: np.ndarray) -> tuple:
-    """Compute raw (uncalibrated) G, S and photon count per pixel.
-
-    Parameters
-    ----------
-    decay   : (ny, nx, n_timebins) float array
-    time_ns : (n_timebins,) bin-centre times in ns
-
-    Returns
-    -------
-    G, S, photons : each (ny, nx)
-    """
-    photons  = decay.sum(axis=2)
-    safe_n   = np.where(photons > 0, photons, 1.0)
-    omega_ns = OMEGA * 1e-9                      # rad / ns
-    cos_t    = np.cos(omega_ns * time_ns)        # (n_timebins,)
-    sin_t    = np.sin(omega_ns * time_ns)
-    G = np.tensordot(decay, cos_t, axes=[[2], [0]]) / safe_n
-    S = np.tensordot(decay, sin_t, axes=[[2], [0]]) / safe_n
-    G = np.where(photons > 0, G, np.nan)
-    S = np.where(photons > 0, S, np.nan)
-    return G, S, photons
-
-
-def apply_phasor_cal(G_raw: np.ndarray, S_raw: np.ndarray,
-                     phase_corr: float, mod_corr: float) -> tuple:
-    """Rotate and scale raw phasor arrays."""
-    c = np.cos(phase_corr)
-    s = np.sin(phase_corr)
-    G_cal = mod_corr * (G_raw * c - S_raw * s)
-    S_cal = mod_corr * (G_raw * s + S_raw * c)
-    return G_cal, S_cal
+def compute_phasor_raw(decay, time_ns):
+    return _lib_compute_phasor_raw(decay, time_ns, rep_rate_hz=REP_RATE_HZ)
 
 
 def load_phasor(row: pd.Series) -> dict | None:

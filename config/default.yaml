@@ -1,0 +1,92 @@
+# Default FLIM pipeline configuration.
+#
+# Mirrors the values hard-coded in notebooks/20260517_KPC_fit.py (Phase E)
+# as of 2026-06-01.  To use from a notebook:
+#
+#     import yaml
+#     cfg = yaml.safe_load(open('../config/default.yaml'))
+#     # Then pass cfg['min_photons_by_ncomp'], cfg['tau_bounds'], etc.
+#     # to src.fitting.compute_fit_mask, src.metrics.compute_tau_mean, etc.
+#
+# YAML can't natively represent (a) None as a dict key or (b) tuples.
+# Conventions used here:
+#   - MIN_PHOTONS_BY_NCOMP fallback uses the special key 'default' instead of
+#     None.  Loader code: mph = cfg['min_photons_by_ncomp']
+#                          mph_dict = {int(k) if k.isdigit() else None: v
+#                                      for k, v in mph.items()}
+#     (using None for keys other than digits, i.e. 'default').
+#   - Tuples are represented as 2-element lists.  Loader converts via tuple(...).
+
+# ---------------------------------------------------------------------------
+# Phase E (quality masking)
+# ---------------------------------------------------------------------------
+
+min_photons_by_ncomp:
+  '1':         500
+  '2':       1000     # lowered from 3000 to recover dim BKO acquisitions
+  '3':       8000
+  'default': 1000     # None fallback when n_components is not parseable
+
+chi2_lo: 0.8
+chi2_hi: 2.0
+
+# Tau component bounds (ps), per fixation_type
+tau_bounds:
+  glu:
+    tau1: [0.0,    200.0]     # ultra-short glutaraldehyde artifact
+    tau2: [50.0,  1200.0]     # free NADH
+    tau3: [800.0, 6000.0]     # bound NADH
+  form:
+    tau1: [50.0,  1500.0]     # free NADH
+    tau2: [800.0, 6000.0]     # bound NADH
+  live:
+    tau1: [50.0,  1500.0]
+    tau2: [800.0, 6000.0]
+
+# Per-pixel amplitude-weighted tau_mean bounds (ps).  null = skip filter.
+# [lo, hi]; either side may be null.
+tau_mean_bounds:
+  glu:  null
+  form: null
+  live: [250.0, null]
+
+# Amplitude-weighted tau_mean = sum(a*tau) / sum(a) over these pairs.
+# Glu skips the a1*tau1 artifact component.
+taumean_cfg:
+  glu:  [[a2, tau2], [a3, tau3]]
+  form: [[a1, tau1], [a2, tau2]]
+  live: [[a1, tau1], [a2, tau2]]
+
+# Amplitude ratio = num / den.
+ratio_cfg:
+  glu:  [a2, a3]
+  form: [a1, a2]
+  live: [a1, a2]
+
+# ---------------------------------------------------------------------------
+# Fit selection
+# ---------------------------------------------------------------------------
+
+preferred_n_comp:
+  glu:  3
+  form: 2
+  live: 2
+
+# ---------------------------------------------------------------------------
+# Phasor
+# ---------------------------------------------------------------------------
+
+rep_rate_hz: 80000000
+phasor_blur_sigma: 2.0
+mask_blur_sigma: 2.0
+mask_fallback_frac: 0.50
+
+# ---------------------------------------------------------------------------
+# Group analysis (Phase F / quickpeek3)
+# ---------------------------------------------------------------------------
+
+# Pockels threshold for the "low PC" matched subset.
+pockels_low_cutoff: 0.3
+
+# Emission filters considered the NADH channel.
+nadh_filters: [457, 475]
