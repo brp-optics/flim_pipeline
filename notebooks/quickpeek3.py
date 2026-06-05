@@ -25,14 +25,18 @@ import textwrap
 from pathlib import Path
 
 # %%
-sdt = pd.read_csv(r'..\results\sdt_metadata_cal.csv')
-df  = pd.read_csv(r'..\results\fit_analysis_summary.csv')
+import sys as _sys_qp3_top
+_sys_qp3_top.path.insert(0, str(Path('..').resolve()))
+from src.preprocess import build_analysis_df
 
-# Bring in pockels from sdt_df only if Phase E didn't already write it
-if 'pockels' not in df.columns:
-    df = df.merge(sdt[['filename', 'pockels']], on='filename', how='left')
+df = build_analysis_df(
+    fit_analysis_csv=r'..\results\fit_analysis_summary.csv',
+    sdt_metadata_csv=r'..\results\sdt_metadata_cal.csv',
+    annotation_csv=r'..\results\position_annotation.csv',
+)
 
-# Same for fit_mask_path
+# fit_mask_path: derive from fit_set_key + raw-data root, since the path
+# isn't stored in fit_analysis_summary.csv.
 if 'fit_mask_path' not in df.columns:
     DATA_ROOT = Path(r'E:\18_RK_Circadian\data\raw')
     def _mask_path(key):
@@ -40,17 +44,8 @@ if 'fit_mask_path' not in df.columns:
         return str(DATA_ROOT / s / r / f'{b}_fit_mask.npy')
     df['fit_mask_path'] = df.fit_set_key.apply(_mask_path)
 
-# treatment_duration also needed for the form 10min filter
-if 'treatment_duration' not in df.columns:
-    df = df.merge(sdt[['filename', 'treatment_duration']], on='filename', how='left')
-
-df['date'] = pd.to_datetime(df.session_root.str.split('_').str[0], format='%Y%m%d')
-df['PC']   = ['High' if p > 0.3 else 'Low' for p in df.pockels]
-
-# %%
-annot = pd.read_csv(r'..\results\position_annotation.csv')
-df = df.merge(annot[['filename', 'annotation']], on='filename', how='left')
-df['annotation'] = df['annotation'].fillna('(unannotated)')
+# sdt is still needed below (snapshot cell uses sdt[['filename','pockels']])
+sdt = pd.read_csv(r'..\results\sdt_metadata_cal.csv')
 
 # %% [markdown]
 # ## Step 1: file counts by parameter combination
@@ -68,11 +63,15 @@ df.groupby(['fixation_type', 'date', 'cell_type', 'em_filter_nm', 'PC', 'annotat
 # ## Step 2: pick matched subsets and display photons grids
 
 # %%
-FORM = df.loc[(df.fixation_type=='form') & (df.em_filter_nm==457)
-              & (df.PC=='Low') & (df.annotation=='colony_deep')] \
-         .sort_values(['date', 'cell_type', 'filename']).reset_index(drop=True)
-LIVE = df.loc[(df.fixation_type=='live') & (df.em_filter_nm==457) & (df.PC=='Low')] \
-         .sort_values(['date', 'cell_type', 'filename']).reset_index(drop=True)
+from src.preprocess import filter_subset
+
+FORM = (filter_subset(df, fixation_type='form', em_filter_nm=457,
+                      PC='Low', annotation='colony_deep')
+        .sort_values(['date', 'cell_type', 'filename'])
+        .reset_index(drop=True))
+LIVE = (filter_subset(df, fixation_type='live', em_filter_nm=457, PC='Low')
+        .sort_values(['date', 'cell_type', 'filename'])
+        .reset_index(drop=True))
 print('FORM:'); print(FORM.groupby(['date', 'cell_type']).size())
 print('\nLIVE:'); print(LIVE.groupby(['date', 'cell_type']).size())
 
@@ -106,31 +105,11 @@ PAIRS = [
      r'E:\18_RK_Circadian\data\raw\20260517_KPC_live_on_SLIM\fitet-sz-c2-b5\3_BKOCO2live_740nm_3097mW_u1_poc0p2_20x0p75NA_457s50_g70_z1_256pix_basicFLIM_120f_0008_fit_mask.npy'),
 ]
 
-def label_of(stem):
-    s = stem.upper()
-    cell = 'BKO' if 'BKO' in s else 'KPCWT'
-    if   'LIVE' in s:       cond = 'live'
-    elif 'FORM20MIN' in s:  cond = 'form 20min'
-    elif 'FORM10MIN' in s:  cond = 'form 10min'
-    elif 'FORM' in s:       cond = 'form'
-    elif 'GLU' in s:        cond = 'glu'
-    else:                   cond = '?'
-    return f'{cell} {cond}'
+# label_of migrated to src/preprocess.py
+from src.preprocess import label_of
 
-def load_all(mask_path):
-    p = Path(mask_path)
-    folder = p.parent
-    stem = p.name.replace('_fit_mask.npy', '')
-    arrs = {
-        'photons':  np.loadtxt(folder / f'{stem}_photons.asc'),
-        'tau_mean': np.loadtxt(folder / f'{stem}_color coded value.asc'),
-        'a1':       np.loadtxt(folder / f'{stem}_a1.asc'),
-        'a2':       np.loadtxt(folder / f'{stem}_a2.asc'),
-        'chi2':     np.loadtxt(folder / f'{stem}_chi.asc'),
-        'mask':     np.load(p),
-    }
-    arrs['a1/a2'] = np.where(arrs['a2'] > 0, arrs['a1']/arrs['a2'], np.nan)
-    return arrs, stem
+# load_all migrated to src/io.load_image_bundle (identical semantics).
+from src.io import load_image_bundle as load_all
 
 # show_row migrated to utils/helpers.show_image_row (identical defaults).
 from utils.helpers import show_image_row as show_row

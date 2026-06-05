@@ -1,5 +1,39 @@
 # Default FLIM pipeline configuration.
 #
+# ---------------------------------------------------------------------------
+# Raw .sdt session directories  (FALLBACK -- prefer config/data_dirs.yaml)
+# ---------------------------------------------------------------------------
+# Phase A (notebooks/20260507_KPC_explore) is the authoritative source for
+# this list.  When Phase A runs it writes config/data_dirs.yaml; downstream
+# phases call src.config.get_data_dirs() which prefers that file.
+#
+# This section is the fallback used only when data_dirs.yaml is absent
+# (e.g. fresh checkout where Phase A hasn't been run yet).  Hand-edit only
+# if you're bootstrapping a new machine -- the next Phase A run will
+# regenerate data_dirs.yaml.
+
+data_dirs:
+  win:
+    - 'E:\18_RK_Circadian\data\raw\20260429_KPC_fixed_dishes_on_SLIM'
+    - 'E:\18_RK_Circadian\data\raw\20260501_KPC_fixed_dishes_on_SLIM'
+    - 'E:\18_RK_Circadian\data\raw\20260509_KPC_fixed_dishes_on_SLIM'
+    - 'E:\18_RK_Circadian\data\raw\20260508_KPC_live_on_SLIM'
+    - 'E:\18_RK_Circadian\data\raw\20260517_KPC_live_on_SLIM'
+    - 'E:\18_RK_Circadian\data\raw\20260520_KPC_fixed_dishes_SLIM'
+    - 'E:\18_RK_Circadian\data\raw\20260521_KPC_live_SLIM'
+    - 'E:\18_RK_Circadian\data\raw\20260522_KPC_fixed_dishes_SLIM'
+  lin:
+    - '/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260429_KPC_fixed_dishes_on_SLIM'
+    - '/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260501_KPC_fixed_dishes_on_SLIM'
+    - '/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260509_KPC_fixed_dishes_on_SLIM'
+    - '/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260508_KPC_live_on_SLIM'
+    - '/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260517_KPC_live_on_SLIM'
+    - '/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260520_KPC_fixed_dishes_SLIM'
+    - '/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260521_KPC_live_SLIM'
+    - '/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260522_KPC_fixed_dishes_SLIM'
+
+
+#
 # Mirrors the values hard-coded in notebooks/20260517_KPC_fit.py (Phase E)
 # as of 2026-06-01.  To use from a notebook:
 #

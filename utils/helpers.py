@@ -160,6 +160,118 @@ def show_image_row(
 # Photons grid
 # ---------------------------------------------------------------------------
 
+def violin_grid(
+    df,
+    metric: str,
+    *,
+    row_by: str | None = None,
+    col_by: str | None = None,
+    group_by: str = "cell_type",
+    row_order: Sequence | None = None,
+    col_order: Sequence | None = None,
+    group_order: Sequence,
+    group_colors: dict | None = None,
+    figsize_per_panel: tuple = (4, 4),
+    sharey: bool = True,
+    min_n: int = 2,
+    title_fmt: str = "{row_v} / {col_v}\nn={n_str}",
+    row_label_fmt: str | None = None,
+    col_label_fmt: str | None = None,
+    suptitle: str | None = None,
+    seed: int = 0,
+):
+    """Grid of violin+scatter panels — rows by `row_by`, cols by `col_by`.
+
+    Each panel is one (row_value, col_value) slice of `df`, with `violin_panel`
+    drawing the inner violin+jitter for groups along the x-axis.
+
+    Args:
+        df:           DataFrame.
+        metric:       numeric column to compare.
+        row_by:       column name for row faceting; None => 1 row.
+        col_by:       column name for col faceting; None => 1 col.
+        group_by:     column distinguishing the two groups within each panel.
+        row_order:    sequence of row_by values to plot, in order; None => sorted unique.
+        col_order:    sequence of col_by values; None => sorted unique.
+        group_order:  ordered list of group labels (required).
+        group_colors: {label: color}; defaults to set2_palette(group_order).
+        figsize_per_panel: (w, h) inches.
+        sharey:       share y-axis across panels.
+        min_n:        a group with < min_n rows is dropped from a panel.
+        title_fmt:    f-string with placeholders {row_v}, {col_v}, {n_str}.
+                      For 1-d grids, the empty axis still substitutes ''.
+        row_label_fmt / col_label_fmt: optional pre-formatters applied to the
+                      row/col value before substitution (e.g. "{:.0f} nm").
+        suptitle:     figure title.
+        seed:         RNG seed for jitter (forwarded to violin_panel).
+
+    Returns (fig, axes).  axes is always 2-D so callers can index axes[ri][ci].
+    """
+    if group_colors is None:
+        group_colors = set2_palette(group_order)
+
+    # Determine row / col axes
+    def _vals(col):
+        return sorted(df[col].dropna().unique()) if col else [None]
+
+    rows = list(row_order) if row_order is not None else _vals(row_by)
+    cols = list(col_order) if col_order is not None else _vals(col_by)
+
+    n_rows = max(len(rows), 1)
+    n_cols = max(len(cols), 1)
+
+    fig, axes = plt.subplots(
+        n_rows, n_cols,
+        figsize=(figsize_per_panel[0] * n_cols, figsize_per_panel[1] * n_rows),
+        squeeze=False, sharey=sharey,
+    )
+
+    def _fmt(value, fmt):
+        if value is None:
+            return ""
+        if fmt is None:
+            return str(value)
+        try:
+            return fmt.format(value)
+        except Exception:
+            return str(value)
+
+    for ri, row_v in enumerate(rows):
+        for ci, col_v in enumerate(cols):
+            ax  = axes[ri][ci]
+            sub = df
+            if row_by and row_v is not None:
+                sub = sub[sub[row_by] == row_v]
+            if col_by and col_v is not None:
+                sub = sub[sub[col_by] == col_v]
+            sub = sub.dropna(subset=[metric])
+
+            cts_here, _groups = violin_panel(
+                ax, sub, metric,
+                ct_order=group_order, ct_colors=group_colors,
+                group_col=group_by, min_n=min_n,
+                seed=seed,
+            )
+
+            n_str = "  ".join(
+                f"{ct}:{(sub[group_by] == ct).sum()}"
+                for ct in cts_here
+            )
+            ax.set_title(
+                title_fmt.format(
+                    row_v=_fmt(row_v, row_label_fmt),
+                    col_v=_fmt(col_v, col_label_fmt),
+                    n_str=n_str,
+                ),
+                fontsize=8,
+            )
+
+    if suptitle:
+        fig.suptitle(suptitle, fontsize=11)
+
+    return fig, axes
+
+
 def show_photons_grid(
     subset,
     mask_path_col: str = "fit_mask_path",

@@ -17,6 +17,7 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 from utils.helpers import (    # noqa: E402
     set2_palette,
     violin_panel,
+    violin_grid,
     show_image_row,
     DEFAULT_IMAGE_PANELS,
 )
@@ -79,6 +80,60 @@ def test_violin_panel_no_data_text():
     plt.close(fig)
     assert cts == []
     assert groups == []
+
+
+def test_violin_grid_2d_layout():
+    rng = np.random.default_rng(0)
+    fixation = ["form", "live"] * 80
+    channel  = [457, 535] * 80
+    cells    = ["KPCWT"] * 80 + ["BKO"] * 80
+    df = pd.DataFrame({
+        "fixation_type": rng.permutation(fixation),
+        "em_filter_nm":  rng.permutation(channel),
+        "cell_type":     rng.permutation(cells),
+        "metric":        rng.normal(0, 1, 160),
+    })
+    fig, axes = violin_grid(
+        df, "metric",
+        row_by="fixation_type", col_by="em_filter_nm",
+        group_order=["KPCWT", "BKO"],
+        suptitle="test",
+    )
+    assert axes.shape == (2, 2)
+    plt.close(fig)
+
+
+def test_violin_grid_single_dim():
+    df = pd.DataFrame({
+        "session": ["s1"] * 6 + ["s2"] * 6,
+        "cell_type": (["KPCWT"] * 3 + ["BKO"] * 3) * 2,
+        "metric":  [1.0, 2, 3, 10, 11, 12, 4, 5, 6, 7, 8, 9],
+    })
+    fig, axes = violin_grid(
+        df, "metric",
+        col_by="session",
+        group_order=["KPCWT", "BKO"],
+    )
+    assert axes.shape == (1, 2)
+    plt.close(fig)
+
+
+def test_violin_grid_empty_panel_does_not_crash():
+    df = pd.DataFrame({
+        "fixation_type": ["form"] * 4,
+        "em_filter_nm":  [457] * 4,
+        "cell_type":     ["KPCWT"] * 2 + ["BKO"] * 2,
+        "metric":        [1.0, 2, 10, 11],
+    })
+    # row='live' has no rows -> panel shows "no data"
+    fig, axes = violin_grid(
+        df, "metric",
+        row_by="fixation_type", col_by="em_filter_nm",
+        row_order=["form", "live"],
+        group_order=["KPCWT", "BKO"],
+    )
+    assert axes.shape == (2, 1)
+    plt.close(fig)
 
 
 def test_show_image_row_renders():

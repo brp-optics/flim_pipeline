@@ -17,28 +17,12 @@ from scipy.ndimage import gaussian_filter
 from sdtfile import SdtFile
 
 # -- Configuration ----------------------------------------------------------
-WIN_DATA_DIRS = [
-    Path(r"E:\18_RK_Circadian\data\raw\20260429_KPC_fixed_dishes_on_SLIM"),
-    Path(r"E:\18_RK_Circadian\data\raw\20260501_KPC_fixed_dishes_on_SLIM"),
-    Path(r"E:\18_RK_Circadian\data\raw\20260509_KPC_fixed_dishes_on_SLIM"),
-    Path(r"E:\18_RK_Circadian\data\raw\20260508_KPC_live_on_SLIM"),
-    Path(r"E:\18_RK_Circadian\data\raw\20260517_KPC_live_on_SLIM"),
-    Path(r"E:\18_RK_Circadian\data\raw\20260520_KPC_fixed_dishes_SLIM"),
-    Path(r"E:\18_RK_Circadian\data\raw\20260521_KPC_live_SLIM"),
-    Path(r"E:\18_RK_Circadian\data\raw\20260522_KPC_fixed_dishes_SLIM"),
-]
-LIN_DATA_DIRS = [
-    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260429_KPC_fixed_dishes_on_SLIM"),
-    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260501_KPC_fixed_dishes_on_SLIM"),
-    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260509_KPC_fixed_dishes_on_SLIM"),
-    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260508_KPC_live_on_SLIM"),
-    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260517_KPC_live_on_SLIM"),
-    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260520_KPC_fixed_dishes_SLIM"),
-    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260521_KPC_live_SLIM"),
-    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260522_KPC_fixed_dishes_SLIM"),
-]
-CURRENT_OS = "Win"
-data_dirs = WIN_DATA_DIRS if CURRENT_OS == "Win" else LIN_DATA_DIRS
+# data_dirs are set by Phase A (notebooks/20260507_KPC_explore.py) and
+# persisted to config/data_dirs.yaml.
+import sys as _sys_cfg_d
+_sys_cfg_d.path.insert(0, str(Path("..").resolve()))
+from src.config import get_data_dirs
+data_dirs = get_data_dirs()
 
 REP_RATE_HZ = 80e6                    # laser repetition rate (Hz)
 OMEGA       = 2.0 * np.pi * REP_RATE_HZ   # angular frequency (rad/s)

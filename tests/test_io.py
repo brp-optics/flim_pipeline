@@ -19,6 +19,7 @@ from src.io import (    # noqa: E402
     fit_dir_from_key,
     load_asc_fit_set,
     load_saved_mask,
+    load_image_bundle,
 )
 
 
@@ -157,3 +158,23 @@ def test_load_saved_mask_missing_returns_none(tmp_path):
     (session / "fitet-sz-b9").mkdir(parents=True)
     out = load_saved_mask("SESSION_X::fitet-sz-b9::stem_NO", [session])
     assert out is None
+
+
+# ---------------------------------------------------------------------------
+# load_image_bundle
+# ---------------------------------------------------------------------------
+
+def test_load_image_bundle_roundtrip(tmp_path):
+    stem = "img_0001"
+    np.savetxt(tmp_path / f"{stem}_photons.asc",            np.full((4, 4), 1000.0))
+    np.savetxt(tmp_path / f"{stem}_color coded value.asc", np.full((4, 4), 1500.0))
+    np.savetxt(tmp_path / f"{stem}_a1.asc",                 np.full((4, 4), 0.6))
+    np.savetxt(tmp_path / f"{stem}_a2.asc",                 np.full((4, 4), 0.4))
+    np.savetxt(tmp_path / f"{stem}_chi.asc",                np.full((4, 4), 1.0))
+    np.save   (tmp_path / f"{stem}_fit_mask.npy", np.ones((4, 4), dtype=bool))
+
+    arrs, base_stem = load_image_bundle(tmp_path / f"{stem}_fit_mask.npy")
+    assert base_stem == stem
+    assert set(arrs.keys()) == {"photons", "tau_mean", "a1", "a2",
+                                  "chi2", "mask", "a1/a2"}
+    np.testing.assert_allclose(arrs["a1/a2"], np.full((4, 4), 1.5))

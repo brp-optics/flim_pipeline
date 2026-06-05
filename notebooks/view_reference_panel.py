@@ -24,28 +24,12 @@ from matplotlib.colors import LogNorm
 
 RESULTS_DIR = Path("../results")
 
-WIN_DATA_DIRS = [
-    Path(r"E:\18_RK_Circadian\data\raw\20260429_KPC_fixed_dishes_on_SLIM"),
-    Path(r"E:\18_RK_Circadian\data\raw\20260501_KPC_fixed_dishes_on_SLIM"),
-    Path(r"E:\18_RK_Circadian\data\raw\20260509_KPC_fixed_dishes_on_SLIM"),
-    Path(r"E:\18_RK_Circadian\data\raw\20260508_KPC_live_on_SLIM"),
-    Path(r"E:\18_RK_Circadian\data\raw\20260517_KPC_live_on_SLIM"),
-    Path(r"E:\18_RK_Circadian\data\raw\20260520_KPC_fixed_dishes_SLIM"),
-    Path(r"E:\18_RK_Circadian\data\raw\20260521_KPC_live_SLIM"),
-    Path(r"E:\18_RK_Circadian\data\raw\20260522_KPC_fixed_dishes_SLIM"),
-]
-LIN_DATA_DIRS = [
-    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260429_KPC_fixed_dishes_on_SLIM"),
-    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260501_KPC_fixed_dishes_on_SLIM"),
-    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260509_KPC_fixed_dishes_on_SLIM"),
-    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260508_KPC_live_on_SLIM"),
-    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260517_KPC_live_on_SLIM"),
-    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260520_KPC_fixed_dishes_SLIM"),
-    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260521_KPC_live_SLIM"),
-    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260522_KPC_fixed_dishes_SLIM"),
-]
-CURRENT_OS = "Win"
-DATA_DIRS = WIN_DATA_DIRS if CURRENT_OS == "Win" else LIN_DATA_DIRS
+# data_dirs are set by Phase A (notebooks/20260507_KPC_explore.py) and
+# persisted to config/data_dirs.yaml.
+import sys as _sys_cfg_v
+_sys_cfg_v.path.insert(0, str(Path("..").resolve()))
+from src.config import get_data_dirs
+DATA_DIRS = get_data_dirs()
 
 GROUPS = [("live", "KPCWT"), ("live", "BKO"), ("form", "KPCWT"), ("form", "BKO")]
 

@@ -135,28 +135,13 @@ from scipy.ndimage import uniform_filter
 from sdtfile import SdtFile
 
 # -- Configuration ----------------------------------------------------------
-WIN_DATA_DIRS = [
-    Path(r"E:\18_RK_Circadian\data\raw\20260429_KPC_fixed_dishes_on_SLIM"),
-    Path(r"E:\18_RK_Circadian\data\raw\20260501_KPC_fixed_dishes_on_SLIM"),
-    Path(r"E:\18_RK_Circadian\data\raw\20260509_KPC_fixed_dishes_on_SLIM"),
-    Path(r"E:\18_RK_Circadian\data\raw\20260508_KPC_live_on_SLIM"),
-    Path(r"E:\18_RK_Circadian\data\raw\20260517_KPC_live_on_SLIM"),
-    Path(r"E:\18_RK_Circadian\data\raw\20260520_KPC_fixed_dishes_SLIM"),
-    Path(r"E:\18_RK_Circadian\data\raw\20260521_KPC_live_SLIM"),
-    Path(r"E:\18_RK_Circadian\data\raw\20260522_KPC_fixed_dishes_SLIM"),
-]
-LIN_DATA_DIRS = [
-    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260429_KPC_fixed_dishes_on_SLIM"),
-    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260501_KPC_fixed_dishes_on_SLIM"),
-    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260509_KPC_fixed_dishes_on_SLIM"),
-    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260508_KPC_live_on_SLIM"),
-    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260517_KPC_live_on_SLIM"),
-    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260520_KPC_fixed_dishes_SLIM"),
-    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260521_KPC_live_SLIM"),
-    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260522_KPC_fixed_dishes_SLIM"),
-]
-CURRENT_OS = "Win"
-data_dirs = WIN_DATA_DIRS if CURRENT_OS == "Win" else LIN_DATA_DIRS
+# data_dirs are set by Phase A (notebooks/20260507_KPC_explore.py) and
+# persisted to config/data_dirs.yaml.  get_data_dirs() returns the paths
+# from that file that exist on this machine.
+import sys as _sys_cfg
+_sys_cfg.path.insert(0, str(Path("..").resolve()))
+from src.config import get_data_dirs
+data_dirs = get_data_dirs()
 
 # Minimum total photon count in the SPCImage-binned region (sum over the
 # (2b+1)^2 neighbourhood), per number of fit components.
@@ -326,158 +311,43 @@ FORCE_RECOMPUTE = True
 # Set False to fall back to sf fits when no sz folder exists.
 REQUIRE_SHIFT_ZERO = True
 
-sample_filenames = set(sdt_df.loc[sdt_df["file_type"] == "sample", "filename"])
-sample_key_rows  = fit_map_df[fit_map_df["sdt_filename"].isin(sample_filenames)]
-sample_keys      = sorted(set(sample_key_rows["fit_set_key"]))
-print(f"Unique fit sets to process: {len(sample_keys)}")
-
-# Load existing summary as cache
-_summary_path = results_dir / "fit_mask_summary.csv"
-if not FORCE_RECOMPUTE and _summary_path.exists():
-    _cache_df = pd.read_csv(_summary_path).set_index("fit_set_key")
-    print(f"  Cache: {len(_cache_df)} existing entries in fit_mask_summary.csv")
-else:
-    _cache_df = pd.DataFrame()
-
-# Build fast lookups
-fn_to_meta = sdt_df.set_index("filename")[["filepath", "fixation_type"]].to_dict("index")
-key_to_fn  = (
-    sample_key_rows.groupby("fit_set_key")["sdt_filename"].first().to_dict()
+# Step 15 loop migrated to pipeline.batch.process_all_fit_sets.
+# Result writers in pipeline.export.  Behaviour identical to the
+# previous inline loop (same cache logic, same per-row dict shape).
+from pipeline.batch  import process_all_fit_sets
+from pipeline.export import (
+    write_per_folder_quality_summaries,
+    write_low_retention_log,
+    print_retention_stats,
 )
 
-mask_summary_rows = []
-n_cached = 0
-n_computed = 0
-_low_ret_log = []   # (sdt_filename, fit_folder, b_val, pct_final)
+mask_summary_df, _low_ret_log = process_all_fit_sets(
+    fit_map_df=fit_map_df,
+    sdt_df=sdt_df,
+    data_dirs=data_dirs,
+    force_recompute=FORCE_RECOMPUTE,
+    cache_csv_path=results_dir / "fit_mask_summary.csv",
+    min_photons_by_ncomp=MIN_PHOTONS_BY_NCOMP,
+    chi2_lo=CHI2_LO, chi2_hi=CHI2_HI,
+    tau_bounds=TAU_BOUNDS, tau_mean_bounds=TAU_MEAN_BOUNDS,
+    taumean_cfg=TAUMEAN_CFG,
+)
 
-for fit_set_key in sample_keys:
-    fit_dir, session_root, rel_dir, base_stem = fit_dir_from_key(fit_set_key)
-    if fit_dir is None or not fit_dir.exists():
-        print(f"  [SKIP] fit dir not found: {fit_set_key[:60]}")
-        continue
+write_low_retention_log(_low_ret_log,
+                         results_dir / "low_retention_warnings.txt")
 
-    mask_npy = fit_dir / f"{base_stem}_fit_mask.npy"
-
-    # Cache hit: .npy on disk and summary row present
-    if (not FORCE_RECOMPUTE
-            and mask_npy.exists()
-            and fit_set_key in _cache_df.index):
-        row_dict = _cache_df.loc[fit_set_key]
-        # loc returns a DataFrame when index is non-unique; take first row
-        if isinstance(row_dict, pd.DataFrame):
-            row_dict = row_dict.iloc[0]
-        row_dict = row_dict.to_dict()
-        row_dict["fit_set_key"] = fit_set_key   # index not included in to_dict()
-        mask_summary_rows.append(row_dict)
-        n_cached += 1
-        continue
-
-    # Cache miss: load .asc files and recompute
-    folder_meta   = parse_fit_folder(Path(rel_dir).name)
-    b_val         = folder_meta["b_val"]
-    shift_free    = folder_meta["shift_free"]
-    sdt_filename  = key_to_fn.get(fit_set_key)
-    sdt_meta      = fn_to_meta.get(sdt_filename, {}) if sdt_filename else {}
-    fixation_type = sdt_meta.get("fixation_type")
-    sdt_path      = sdt_meta.get("filepath")
-
-    fd = load_asc_fit_set(fit_dir, base_stem)
-    if not fd:
-        print(f"  [SKIP] no .asc files loaded: {base_stem}")
-        continue
-
-    sdt_photons = None
-    if "photons" not in fd and sdt_path:
-        try:
-            sdt_obj     = SdtFile(str(sdt_path))
-            sdt_photons = sdt_obj.data[0].astype(float).sum(axis=2)
-        except Exception:
-            pass
-
-    mask, breakdown = compute_fit_mask(fd, fixation_type, b_val, sdt_photons,
-                                       n_components=folder_meta.get("n_components"))
-    np.save(str(mask_npy), mask)
-
-    pct_final = breakdown.get("pct_final", 100.0)
-    if pct_final < 1.0:
-        _low_ret_log.append((sdt_filename or base_stem, rel_dir, b_val, pct_final))
-
-    mask_summary_rows.append({
-        "fit_set_key":   fit_set_key,
-        "sdt_filename":  sdt_filename,
-        "session_root":  session_root,
-        "fit_folder":    rel_dir,
-        "base_stem":     base_stem,
-        "b_val":         b_val,
-        "shift_free":    shift_free,
-        "fixation_type": fixation_type,
-        **breakdown,
-    })
-    n_computed += 1
-
-    if n_computed % 20 == 0:
-        n_tot = breakdown.get("n_total", 1) or 1
-        def _pct(k): return round(100.0 * breakdown.get(k, 0) / n_tot)
-        print(f"  computed {n_computed}  {base_stem[:32]}"
-              f"  ph={_pct('n_photon_ok')}%"
-              f"  chi2={_pct('n_chi2_ok')}%"
-              f"  amp={_pct('n_amp_ok')}%"
-              f"  tau={_pct('n_tau_ok')}%"
-              f"  taum={_pct('n_taumean_ok')}%"
-              f"  kept={breakdown.get('pct_final', '?')}%")
-
-mask_summary_df = pd.DataFrame(mask_summary_rows)
-print(f"\nDone: {len(mask_summary_df)} fit sets  "
-      f"({n_cached} cached, {n_computed} newly computed)")
-
-# Files where < 1% of pixels passed all quality criteria.
-# These should be re-fit with a higher bin value (larger b_val) before analysis.
-_low_ret_path = results_dir / "low_retention_warnings.txt"
-if _low_ret_log:
-    print(f"\n[WARNING] {len(_low_ret_log)} fit set(s) with <1% pixels accepted"
-          f" -- written to {_low_ret_path}")
-    with open(str(_low_ret_path), "w") as _f:
-        _f.write("# Fit sets with <1% pixel retention -- re-fit with higher b_val\n")
-        _f.write("# Generated by Phase E Step 15\n\n")
-        for _fn, _folder, _b, _pct in _low_ret_log:
-            _msg = f"pct={_pct:.2f}%  b={_b}  folder={_folder}  file={_fn}"
-            print(f"  [LOW RETENTION] {_msg}")
-            _f.write(_msg + "\n")
-else:
-    if _low_ret_path.exists():
-        _low_ret_path.unlink()   # clean up stale log from previous run
-    print("  No low-retention fit sets (all >= 1%).")
-
-# Build set of fit_set_keys with <1% retention for downstream filtering.
+# Set of fit_set_keys with <1% retention; downstream steps exclude these.
 _low_ret_keys = set()
 if not mask_summary_df.empty and "pct_final" in mask_summary_df.columns:
     _low_ret_keys = set(
         mask_summary_df.loc[mask_summary_df["pct_final"] < 1.0, "fit_set_key"]
     )
 
-# Write fit_quality_summary.csv in each fit folder
-for (session_root, fit_folder), grp in mask_summary_df.groupby(
-    ["session_root", "fit_folder"]
-):
-    session_dir = next((d for d in data_dirs if d.name == session_root), None)
-    if session_dir is None:
-        continue
-    out_path = session_dir / Path(fit_folder) / "fit_quality_summary.csv"
-    cols_drop = ["session_root", "fit_folder", "fit_set_key"]
-    grp.drop(columns=cols_drop, errors="ignore").to_csv(out_path, index=False)
-
-# Global summary
+write_per_folder_quality_summaries(mask_summary_df, data_dirs)
 mask_summary_df.to_csv(results_dir / "fit_mask_summary.csv", index=False)
 print(f"Saved global mask summary -> {results_dir / 'fit_mask_summary.csv'}")
 
-# Retention statistics by fixation_type
-if not mask_summary_df.empty and "pct_final" in mask_summary_df.columns:
-    print("\nPixel retention by fixation_type (%):")
-    print(mask_summary_df.groupby("fixation_type")["pct_final"]
-          .agg(["mean", "median", "min", "max"]).round(1).to_string())
-    print("\nPer-criterion counts (mean over files):")
-    crit_cols = ["n_photon_ok", "n_chi2_ok", "n_amp_ok", "n_tau_ok", "n_final"]
-    print(mask_summary_df.groupby("fixation_type")[crit_cols].mean().round(0).to_string())
+print_retention_stats(mask_summary_df)
 
 # %% [markdown]
 # ## Step 15b: Mask failure diagnosis

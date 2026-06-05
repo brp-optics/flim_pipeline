@@ -764,62 +764,31 @@ else:
 # Both channel panels share the same y-axis so amplitudes are directly comparable.
 
 # %%
-palette  = plt.cm.Set2(np.linspace(0, 0.8, max(len(ct_present), 1)))
-ct_color = {ct: palette[i] for i, ct in enumerate(ct_present)}
+import sys as _sys_viz
+_sys_viz.path.insert(0, str(Path("..").resolve()))
+from utils.helpers import set2_palette, violin_grid
 
+ct_color = set2_palette(ct_present)
 _channels_21 = sorted(df_analysis["em_filter_nm"].dropna().unique())
-_n_rows      = len(fix_present)
-_n_cols      = max(len(_channels_21), 1)
+
+# Filter once to the cell types of interest; the grid handles the rest.
+_df_21 = df_analysis[df_analysis["cell_type"].isin(ct_present)]
 
 for metric in all_metrics:
     label = METRIC_LABELS.get(metric, metric)
-    fig, axes = plt.subplots(_n_rows, _n_cols,
-                             figsize=(4 * _n_cols, 4 * _n_rows),
-                             squeeze=False,
-                             sharey=True)
-
-    for ri, fix_type in enumerate(fix_present):
-        for ci, ch in enumerate(_channels_21):
-            ax = axes[ri][ci]
-            sub = (df_analysis[(df_analysis["fixation_type"] == fix_type) &
-                               (df_analysis["em_filter_nm"]  == ch) &
-                               df_analysis["cell_type"].isin(ct_present)]
-                   .dropna(subset=[metric]))
-
-            # Require >= 2 non-NaN values per group: violinplot KDE fails with n < 2.
-            cts_here = [ct for ct in ct_present
-                        if (sub["cell_type"] == ct).sum() >= 2]
-            groups   = [sub[sub["cell_type"] == ct][metric].values for ct in cts_here]
-            colors   = [ct_color[ct] for ct in cts_here]
-
-            if not groups:
-                ax.set_title(f"{fix_type} / {ch} nm\n(no data)", fontsize=8)
-                continue
-
-            parts = ax.violinplot(groups, positions=range(len(groups)),
-                                  showmedians=True, showextrema=True)
-            for pc, col in zip(parts["bodies"], colors):
-                pc.set_facecolor(col)
-                pc.set_alpha(0.65)
-            for key in ("cmedians", "cbars", "cmins", "cmaxes"):
-                if key in parts:
-                    parts[key].set_color("k")
-                    parts[key].set_linewidth(1.2)
-
-            rng = np.random.default_rng(seed=0)
-            for j, (grp, col) in enumerate(zip(groups, colors)):
-                jitter = rng.uniform(-0.07, 0.07, len(grp))
-                ax.scatter(j + jitter, grp, s=14, color=col, alpha=0.6, zorder=3)
-
-            ax.set_xticks(range(len(cts_here)))
-            ax.set_xticklabels(cts_here, fontsize=9)
-            if ci == 0:
-                ax.set_ylabel(label)
-            n_str = "  ".join(f"{ct}:{(sub['cell_type']==ct).sum()}"
-                              for ct in cts_here)
-            ax.set_title(f"{fix_type} / {ch} nm\nn={n_str}", fontsize=8)
-
-    fig.suptitle(label, fontsize=11)
+    fig, axes = violin_grid(
+        _df_21, metric,
+        row_by="fixation_type", col_by="em_filter_nm",
+        row_order=fix_present, col_order=_channels_21,
+        group_order=ct_present, group_colors=ct_color,
+        figsize_per_panel=(4, 4),
+        title_fmt="{row_v} / {col_v} nm\nn={n_str}",
+        col_label_fmt="{:.0f}",
+        suptitle=label,
+    )
+    # Per-row y-axis label on leftmost column
+    for ri in range(axes.shape[0]):
+        axes[ri][0].set_ylabel(label)
     plt.tight_layout()
     _savefig(fig, f"fig_violin_{metric}")
     plt.show()
@@ -888,55 +857,22 @@ for _m21c in all_metrics:
             if not _sessions_fc:
                 continue
 
-            _n_sess21c = len(_sessions_fc)
-            _fig21c, _axes21c = plt.subplots(
-                1, _n_sess21c,
-                figsize=(max(2.8, 2.2 * len(ct_present)) * _n_sess21c, 4.5),
-                squeeze=False,
-                sharey=True,
+            # Display the leading YYYYMMDD instead of the full session_root
+            _df_panel = _sub_fc.assign(
+                _session_label=_sub_fc["session_root"].str.split("_").str[0])
+            _label_order = [s.split("_")[0] for s in _sessions_fc]
+
+            _fig21c, _axes21c = violin_grid(
+                _df_panel, _m21c,
+                col_by="_session_label",
+                col_order=_label_order,
+                group_order=ct_present, group_colors=ct_color,
+                figsize_per_panel=(max(2.8, 2.2 * len(ct_present)), 4.5),
+                title_fmt="{col_v}\nn={n_str}",
+                suptitle=(f"{_lbl21c}  |  {_ft21c}  |  {int(_ch21c)} nm  "
+                          "(per session)"),
             )
-
-            for _si, _sess in enumerate(_sessions_fc):
-                _ax = _axes21c[0][_si]
-                _sub_s = _sub_fc[_sub_fc["session_root"] == _sess]
-                _cts_s = [ct for ct in ct_present
-                          if (_sub_s["cell_type"] == ct).sum() >= 2]
-                _grps_s = [_sub_s[_sub_s["cell_type"] == ct][_m21c].values
-                           for ct in _cts_s]
-                _cols_s = [ct_color[ct] for ct in _cts_s]
-
-                if not _grps_s:
-                    _ax.set_title(f"{_sess.split('_')[0]}\n(no data)", fontsize=8)
-                    continue
-
-                _parts21c = _ax.violinplot(_grps_s, positions=range(len(_grps_s)),
-                                           showmedians=True, showextrema=True)
-                for _pc, _col in zip(_parts21c["bodies"], _cols_s):
-                    _pc.set_facecolor(_col)
-                    _pc.set_alpha(0.65)
-                for _key in ("cmedians", "cbars", "cmins", "cmaxes"):
-                    if _key in _parts21c:
-                        _parts21c[_key].set_color("k")
-                        _parts21c[_key].set_linewidth(1.2)
-
-                _rng21c = np.random.default_rng(seed=_si)
-                for _j, (_grp, _col) in enumerate(zip(_grps_s, _cols_s)):
-                    _jit = _rng21c.uniform(-0.07, 0.07, len(_grp))
-                    _ax.scatter(_j + _jit, _grp, s=14,
-                                color=_col, alpha=0.6, zorder=3)
-
-                _ax.set_xticks(range(len(_cts_s)))
-                _ax.set_xticklabels(_cts_s, fontsize=9)
-                if _si == 0:
-                    _ax.set_ylabel(_lbl21c)
-                _n_s = "  ".join(f"{ct}:{(_sub_s['cell_type']==ct).sum()}"
-                                 for ct in _cts_s)
-                _ax.set_title(f"{_sess.split('_')[0]}\nn={_n_s}", fontsize=8)
-
-            _fig21c.suptitle(
-                f"{_lbl21c}  |  {_ft21c}  |  {int(_ch21c)} nm  (per session)",
-                fontsize=10,
-            )
+            _axes21c[0][0].set_ylabel(_lbl21c)
             plt.tight_layout()
             _savefig(_fig21c,
                      f"fig_violin_sess_{_ft21c}_{int(_ch21c)}_{_m21c}")

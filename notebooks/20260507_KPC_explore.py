@@ -116,40 +116,48 @@ from datetime import datetime
 from sdtfile import SdtFile
 
 # -- Configuration ----------------------------------------------------------
-data_dirs = [ '/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260429_KPC_fixed_dishes_on_SLIM',
-              '/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260501_KPC_fixed_dishes_on_SLIM',
-              '/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260509_KPC_fixed_dishes_on_SLIM',
-              '/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260508_KPC_live_on_SLIM',
-              '/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260517_KPC_live_on_SLIM',
-              '/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260520_KPC_fixed_dishes_SLIM',
-              '/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260521_KPC_live_SLIM',
-              '/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260522_KPC_fixed_dishes_SLIM',
+# Phase A is the AUTHORITATIVE source of session directories for the whole
+# pipeline.  Edit the two lists below when adding a session, then re-run this
+# notebook.  Phase A writes config/data_dirs.yaml and downstream phases read
+# it via src.config.get_data_dirs().
+#
+# Listing both OS variants makes the notebook portable: get_data_dirs() picks
+# whichever set exists on the current machine.
+
+WIN_DATA_DIRS = [
+    r"E:\18_RK_Circadian\data\raw\20260429_KPC_fixed_dishes_on_SLIM",
+    r"E:\18_RK_Circadian\data\raw\20260501_KPC_fixed_dishes_on_SLIM",
+    r"E:\18_RK_Circadian\data\raw\20260509_KPC_fixed_dishes_on_SLIM",
+    r"E:\18_RK_Circadian\data\raw\20260508_KPC_live_on_SLIM",
+    r"E:\18_RK_Circadian\data\raw\20260517_KPC_live_on_SLIM",
+    r"E:\18_RK_Circadian\data\raw\20260520_KPC_fixed_dishes_SLIM",
+    r"E:\18_RK_Circadian\data\raw\20260521_KPC_live_SLIM",
+    r"E:\18_RK_Circadian\data\raw\20260522_KPC_fixed_dishes_SLIM",
+]
+LIN_DATA_DIRS = [
+    "/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260429_KPC_fixed_dishes_on_SLIM",
+    "/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260501_KPC_fixed_dishes_on_SLIM",
+    "/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260509_KPC_fixed_dishes_on_SLIM",
+    "/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260508_KPC_live_on_SLIM",
+    "/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260517_KPC_live_on_SLIM",
+    "/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260520_KPC_fixed_dishes_SLIM",
+    "/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260521_KPC_live_SLIM",
+    "/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260522_KPC_fixed_dishes_SLIM",
 ]
 
-win_data_dirs = [
-    Path("E:\\18_RK_Circadian\\data\\raw\\20260429_KPC_fixed_dishes_on_SLIM"),
-    Path("E:\\18_RK_Circadian\\data\\raw\\20260501_KPC_fixed_dishes_on_SLIM"),
-    Path("E:\\18_RK_Circadian\\data\\raw\\20260509_KPC_fixed_dishes_on_SLIM"),
-    Path("E:\\18_RK_Circadian\\data\\raw\\20260508_KPC_live_on_SLIM"),
-    Path("E:\\18_RK_Circadian\\data\\raw\\20260517_KPC_live_on_SLIM"),
-    Path("E:\\18_RK_Circadian\\data\\raw\\20260520_KPC_fixed_dishes_SLIM"),
-    Path("E:\\18_RK_Circadian\\data\\raw\\20260521_KPC_live_SLIM"),
-    Path("E:\\18_RK_Circadian\\data\\raw\\20260522_KPC_fixed_dishes_SLIM"),
-    ]
+import sys as _sys_cfg_a
+_sys_cfg_a.path.insert(0, str(Path("..").resolve()))
+from src.config import save_data_dirs, get_data_dirs
 
-current_os = "Win" ## Could we automate discovery of this?
+# Persist the lists so downstream phases see what Phase A saw.
+save_data_dirs(WIN_DATA_DIRS, LIN_DATA_DIRS)
 
+# Then use the standard read path -- guarantees Phase A sees exactly what
+# get_data_dirs() will return downstream (existence-filtered, OS-correct).
+data_dirs = get_data_dirs()
 
-data_dirs = [ Path(d) for d in data_dirs ]
-
-if current_os == "Win":
-    data_dirs = win_data_dirs
-
-# Verify directories exist
 for d in data_dirs:
-    if not d.exists():
-        raise FileNotFoundError(f"Data directory not found: {d}")
-    print(f"  Found: {d}  ({sum(1 for _ in d.rglob('*')) } files/dirs)")
+    print(f"  Found: {d}  ({sum(1 for _ in d.rglob('*'))} files/dirs)")
 
 
 # %% [markdown]

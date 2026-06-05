@@ -185,3 +185,36 @@ def load_saved_mask(
         return None
     p = fit_dir / f"{base_stem}_fit_mask.npy"
     return np.load(str(p)) if p.exists() else None
+
+
+def load_image_bundle(mask_path) -> tuple[dict, str]:
+    """Load the standard image bundle for one .sdt file given its mask path.
+
+    Picks SPCImage .asc files alongside the mask by their exact suffixes:
+      photons   = {stem}_photons.asc
+      tau_mean  = {stem}_color coded value.asc       (SPCImage's own tau_mean)
+      a1, a2    = {stem}_a1.asc, {stem}_a2.asc
+      chi2      = {stem}_chi.asc
+      mask      = the .npy file at mask_path
+
+    Returns (arrs, base_stem).  arrs keys: photons, tau_mean, a1, a2, chi2,
+    mask, and a derived 'a1/a2' = a1/a2 (NaN where a2==0).
+
+    Raises if any .asc file is missing; if you'd rather have flexible matching
+    use load_asc_fit_set() instead.
+    """
+    p      = Path(mask_path)
+    folder = p.parent
+    stem   = p.name.replace("_fit_mask.npy", "")
+    arrs = {
+        "photons":  np.loadtxt(folder / f"{stem}_photons.asc"),
+        "tau_mean": np.loadtxt(folder / f"{stem}_color coded value.asc"),
+        "a1":       np.loadtxt(folder / f"{stem}_a1.asc"),
+        "a2":       np.loadtxt(folder / f"{stem}_a2.asc"),
+        "chi2":     np.loadtxt(folder / f"{stem}_chi.asc"),
+        "mask":     np.load(p),
+    }
+    with np.errstate(invalid="ignore", divide="ignore"):
+        arrs["a1/a2"] = np.where(arrs["a2"] > 0, arrs["a1"] / arrs["a2"],
+                                  np.nan)
+    return arrs, stem

@@ -18,28 +18,12 @@ from sdtfile import SdtFile
 from scipy.ndimage import uniform_filter as _uniform_filter
 
 # -- Configuration ----------------------------------------------------------
-WIN_DATA_DIRS = [
-    Path(r"E:\18_RK_Circadian\data\raw\20260429_KPC_fixed_dishes_on_SLIM"),
-    Path(r"E:\18_RK_Circadian\data\raw\20260501_KPC_fixed_dishes_on_SLIM"),
-    Path(r"E:\18_RK_Circadian\data\raw\20260509_KPC_fixed_dishes_on_SLIM"),
-    Path(r"E:\18_RK_Circadian\data\raw\20260508_KPC_live_on_SLIM"),
-    Path(r"E:\18_RK_Circadian\data\raw\20260517_KPC_live_on_SLIM"),
-    Path(r"E:\18_RK_Circadian\data\raw\20260520_KPC_fixed_dishes_SLIM"),
-    Path(r"E:\18_RK_Circadian\data\raw\20260521_KPC_live_SLIM"),
-    Path(r"E:\18_RK_Circadian\data\raw\20260522_KPC_fixed_dishes_SLIM"),
-]
-LIN_DATA_DIRS = [
-    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260429_KPC_fixed_dishes_on_SLIM"),
-    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260501_KPC_fixed_dishes_on_SLIM"),
-    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260509_KPC_fixed_dishes_on_SLIM"),
-    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260508_KPC_live_on_SLIM"),
-    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260517_KPC_live_on_SLIM"),
-    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260520_KPC_fixed_dishes_SLIM"),
-    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260521_KPC_live_SLIM"),
-    Path("/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260522_KPC_fixed_dishes_SLIM"),
-]
-CURRENT_OS = "Win"
-data_dirs = WIN_DATA_DIRS if CURRENT_OS == "Win" else LIN_DATA_DIRS
+# data_dirs are set by Phase A (notebooks/20260507_KPC_explore.py) and
+# persisted to config/data_dirs.yaml.
+import sys as _sys_cfg_i
+_sys_cfg_i.path.insert(0, str(Path("..").resolve()))
+from src.config import get_data_dirs
+data_dirs = get_data_dirs()
 
 CHI2_LO = 0.8    # flag pixels below this
 CHI2_HI = 2.0    # flag pixels above this
