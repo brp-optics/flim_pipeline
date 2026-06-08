@@ -14,4 +14,16 @@ data_dirs:
   - E:\18_RK_Circadian\data\raw\20260520_KPC_fixed_dishes_SLIM
   - E:\18_RK_Circadian\data\raw\20260521_KPC_live_SLIM
   - E:\18_RK_Circadian\data\raw\20260522_KPC_fixed_dishes_SLIM
-  lin: []
+  - E:\18_RK_Circadian\data\raw\20260530_KPC_live_on_SLIM
+  - E:\18_RK_Circadian\data\raw\20260601_KPC_live_on_SLIM
+  lin:
+  - /media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260429_KPC_fixed_dishes_on_SLIM
+  - /media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260501_KPC_fixed_dishes_on_SLIM
+  - /media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260509_KPC_fixed_dishes_on_SLIM
+  - /media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260508_KPC_live_on_SLIM
+  - /media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260517_KPC_live_on_SLIM
+  - /media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260520_KPC_fixed_dishes_SLIM
+  - /media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260521_KPC_live_SLIM
+  - /media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260522_KPC_fixed_dishes_SLIM
+  - /media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260530_KPC_live_on_SLIM
+  - /media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260601_KPC_live_on_SLIM

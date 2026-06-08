@@ -22,7 +22,27 @@ import numpy as np
 def _infer_param_name(stem: str) -> str:
     """Map an .asc file stem to a parameter name (a1, tau1, chi2, ...).
 
-    Falls back to the trailing token after the last underscore.
+    Matches common SPCImage export suffixes via a priority-ordered list of
+    regex patterns.  Falls back to the trailing token after the last
+    underscore when no pattern matches.
+
+    Parameters
+    ----------
+    stem : str
+        .asc filename without extension, e.g. 'myfile_0000-a1' or
+        'myfile_0000_chi'.
+
+    Returns
+    -------
+    str
+        Canonical parameter name: 'a1', 'a2', 'a3', 'tau1', 'tau2',
+        'tau3', 'tau_mean', 'chi2', 'photons', 'scatter', 'shift',
+        'G', or 'S'.  Returns the last underscore-delimited token if no
+        pattern matches.
+
+    Dependencies
+    ------------
+    re
     """
     s = stem.lower()
     for pattern, name in [
@@ -47,8 +67,25 @@ def _infer_param_name(stem: str) -> str:
 
 
 def _strip_param_suffix(stem: str) -> str:
-    """Remove the parameter suffix from an .asc file stem to recover the
-    base stem of the original .sdt file.
+    """Remove the parameter suffix from an .asc file stem to recover the base stem.
+
+    The base stem is the .sdt filename without extension and without the
+    trailing parameter token added by SPCImage on export.
+
+    Parameters
+    ----------
+    stem : str
+        .asc filename without extension, e.g. 'myfile_0000-a1' or
+        'myfile_0000_tau2'.
+
+    Returns
+    -------
+    str
+        Base stem, e.g. 'myfile_0000'.
+
+    Dependencies
+    ------------
+    re
     """
     return re.sub(
         r"[-_]?(a[123]|t[123]|tau[123]|chi|chisq?|photons?|intensity|cnt|"
@@ -76,9 +113,37 @@ def parse_fit_folder(folder_name: str) -> dict:
       'exet600-1400-0-500-fitet-sz-b2'  -> tif exports, color LUT 600-1400 ps,
                                            intensity LUT 0-500, b=2
 
-    Returns dict with keys:
-      b_val, shift_free, kernel_size, n_components,
-      is_export, export_format, color_lo/hi, intensity_lo/hi.
+    Parameters
+    ----------
+    folder_name : str
+        Name of the SPCImage fit or export folder (not a full path).
+
+    Returns
+    -------
+    dict
+        Keys and meaning:
+          'b_val'        -- int, spatial binning radius (kernel = 2*b+1)
+          'shift_free'   -- bool, True if shift was fitted freely ('-sf-')
+          'kernel_size'  -- int, total kernel edge length = 2*b+1
+          'n_components' -- int or None, number of exponential components
+          'is_export'    -- bool, True if this is an export folder (exet*)
+          'export_format'-- 'asc', 'tif', or None
+          'color_lo/hi'  -- float or None, tif colormap range (ps)
+          'intensity_lo/hi' -- float or None, tif intensity range
+
+    Assumptions
+    -----------
+    Folder names follow the BH SPCImage naming convention.  Unknown tokens
+    are silently ignored; defaults are b_val=1, shift_free=False.
+
+    Examples
+    --------
+    >>> parse_fit_folder('fitet-sz-b2-c2')
+    {'b_val': 2, 'shift_free': False, 'kernel_size': 5, 'n_components': 2, ...}
+
+    Dependencies
+    ------------
+    re
     """
     result = {
         "b_val": 1, "shift_free": False, "kernel_size": 3,
@@ -127,11 +192,39 @@ def parse_fit_folder(folder_name: str) -> dict:
 def fit_dir_from_key(fit_set_key: str, data_dirs: Iterable[Path]) -> tuple:
     """Return (fit_dir, session_root, rel_dir, base_stem) for a fit_set_key.
 
-    fit_dir is None if the session directory is not found in data_dirs.
+    fit_set_key encodes a 3-part address: which session, which subdirectory
+    within that session, and which .sdt base stem.  This function resolves
+    the session_root against data_dirs to produce an absolute fit_dir.
 
-    Args:
-        fit_set_key: '<session_root>::<rel_dir>::<base_stem>'
-        data_dirs:   list of session root Paths to search.
+    Parameters
+    ----------
+    fit_set_key : str
+        '<session_root>::<rel_dir>::<base_stem>', e.g.
+        '20260429_KPC_fixed_dishes_on_SLIM::fitet-sz-b2::3_KPCWT0430form20min_..._0000'.
+        The session_root is matched by directory name (not full path).
+    data_dirs : iterable of Path
+        Session root directories to search (from get_data_dirs()).
+
+    Returns
+    -------
+    tuple
+        (fit_dir, session_root, rel_dir, base_stem) where fit_dir is
+        Path or None if the session root is not found in data_dirs.
+
+    Assumptions
+    -----------
+    fit_set_key must contain exactly two '::' separators.  Session roots
+    are matched by their final path component (d.name == session_root).
+
+    Examples
+    --------
+    >>> fit_dir, _, _, stem = fit_dir_from_key(row['fit_set_key'], data_dirs)
+    >>> if fit_dir is not None:
+    ...     fd = load_asc_fit_set(fit_dir, stem)
+
+    Dependencies
+    ------------
+    pathlib
     """
     session_root, rel_dir, base_stem = fit_set_key.split("::", 2)
     session_dir = next((d for d in data_dirs if d.name == session_root), None)
@@ -146,8 +239,43 @@ def fit_dir_from_key(fit_set_key: str, data_dirs: Iterable[Path]) -> tuple:
 def load_asc_fit_set(fit_dir: Path, base_stem: str) -> dict:
     """Load every .asc parameter map for one base stem from a fit folder.
 
-    Returns {param_name: 2D ndarray}.  Files whose stripped stem does not
-    match base_stem are skipped, as are *_statistic*.asc summary files.
+    Globs all .asc files in fit_dir, filters to those whose stripped stem
+    matches base_stem, infers the parameter name, and loads each as a 2-D
+    ndarray.  Summary files (*_statistic*.asc) are skipped.
+
+    Parameters
+    ----------
+    fit_dir : Path
+        Directory containing SPCImage .asc exports (from fit_dir_from_key).
+    base_stem : str
+        .sdt base stem to match, e.g. '3_KPCWT0430form20min_..._0000'.
+        Matching is case-insensitive.
+
+    Returns
+    -------
+    dict
+        {param_name: 2-D ndarray} where param_name is one of 'a1', 'a2',
+        'tau1', 'tau2', 'chi2', 'photons', etc.  Files that fail to load
+        or are not 2-D are silently skipped.
+
+    Side Effects
+    ------------
+    Reads .asc files from disk.
+
+    Assumptions
+    -----------
+    .asc files are space-delimited grids of float values, optionally with a
+    one-line header (skiprows=1 is tried on ValueError).  Only 2-D non-empty
+    arrays are returned.
+
+    Examples
+    --------
+    >>> fd = load_asc_fit_set(fit_dir, '3_KPCWT0430form20min_..._0000')
+    >>> fd.keys()  # {'a1', 'a2', 'tau1', 'tau2', 'chi2', 'photons'}
+
+    Dependencies
+    ------------
+    numpy, pathlib, re, _infer_param_name, _strip_param_suffix
     """
     fd: dict = {}
     for fp in sorted(fit_dir.glob("*.asc")):
@@ -174,11 +302,39 @@ def load_saved_mask(
     fit_set_key: str,
     data_dirs: Iterable[Path],
 ) -> np.ndarray | None:
-    """Load the Phase E _fit_mask.npy for a fit_set_key, or None if missing.
+    """Load the Phase E quality mask (.npy) for a fit_set_key, or None if missing.
 
-    Args:
-        fit_set_key: '<session_root>::<rel_dir>::<base_stem>'
-        data_dirs:   list of session root Paths to search.
+    Resolves the fit_set_key to a directory, then looks for a file named
+    '{base_stem}_fit_mask.npy'.  Returns None rather than raising if the
+    file is absent or the session root is not found in data_dirs.
+
+    Parameters
+    ----------
+    fit_set_key : str
+        '<session_root>::<rel_dir>::<base_stem>' (same format as the
+        'fit_set_key' column in fit_analysis_summary.csv).
+    data_dirs : iterable of Path
+        Session root directories (from get_data_dirs()).
+
+    Returns
+    -------
+    np.ndarray or None
+        Boolean 2-D array (True = pixel passed quality criteria) or None
+        if the .npy file does not exist or the session root is not found.
+
+    Side Effects
+    ------------
+    Reads a .npy file from disk.
+
+    Examples
+    --------
+    >>> mask = load_saved_mask(row['fit_set_key'], data_dirs)
+    >>> if mask is not None:
+    ...     pct_ok = mask.mean() * 100
+
+    Dependencies
+    ------------
+    numpy, pathlib, fit_dir_from_key
     """
     fit_dir, _, _, base_stem = fit_dir_from_key(fit_set_key, data_dirs)
     if fit_dir is None:
@@ -190,18 +346,51 @@ def load_saved_mask(
 def load_image_bundle(mask_path) -> tuple[dict, str]:
     """Load the standard image bundle for one .sdt file given its mask path.
 
-    Picks SPCImage .asc files alongside the mask by their exact suffixes:
-      photons   = {stem}_photons.asc
-      tau_mean  = {stem}_color coded value.asc       (SPCImage's own tau_mean)
-      a1, a2    = {stem}_a1.asc, {stem}_a2.asc
-      chi2      = {stem}_chi.asc
-      mask      = the .npy file at mask_path
+    Picks SPCImage .asc files alongside the mask using exact filename suffixes.
+    This is a convenience wrapper for the common case; for flexible (partial)
+    loading use load_asc_fit_set() instead.
 
-    Returns (arrs, base_stem).  arrs keys: photons, tau_mean, a1, a2, chi2,
-    mask, and a derived 'a1/a2' = a1/a2 (NaN where a2==0).
+    Expected files (all must exist):
+      {stem}_photons.asc           -- raw photon count image
+      {stem}_color coded value.asc -- SPCImage's amplitude-weighted tau_mean
+      {stem}_a1.asc, _a2.asc      -- amplitude components
+      {stem}_chi.asc               -- chi-squared goodness-of-fit image
 
-    Raises if any .asc file is missing; if you'd rather have flexible matching
-    use load_asc_fit_set() instead.
+    Parameters
+    ----------
+    mask_path : path-like
+        Path to the Phase E quality mask file ('{stem}_fit_mask.npy').
+        The stem and folder are inferred from this path.
+
+    Returns
+    -------
+    tuple
+        (arrs, base_stem) where arrs is a dict with keys:
+          'photons'  -- 2-D ndarray, raw photon count per pixel
+          'tau_mean' -- 2-D ndarray, amplitude-weighted lifetime (ps) from fit
+          'a1', 'a2' -- 2-D ndarray, amplitude components
+          'chi2'     -- 2-D ndarray, chi-squared values
+          'mask'     -- 2-D bool ndarray (True = quality-accepted pixel)
+          'a1/a2'    -- 2-D ndarray, ratio (NaN where a2 == 0)
+        base_stem is the .sdt filename without extension or parameter suffix.
+
+    Raises
+    ------
+    FileNotFoundError or OSError
+        If any of the required .asc files is missing.
+
+    Side Effects
+    ------------
+    Reads .asc and .npy files from disk.
+
+    Examples
+    --------
+    >>> arrs, stem = load_image_bundle(row['fit_mask_path'])
+    >>> plt.imshow(np.where(arrs['mask'], arrs['tau_mean'], np.nan))
+
+    Dependencies
+    ------------
+    numpy, pathlib
     """
     p      = Path(mask_path)
     folder = p.parent

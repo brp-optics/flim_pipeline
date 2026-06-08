@@ -37,7 +37,38 @@ DEFAULT_LIFETIME_TICKS_NS  = (0.3, 0.5, 1.0, 2.0, 4.0)
 # ---------------------------------------------------------------------------
 
 def otsu_threshold(img: np.ndarray) -> float:
-    """Otsu threshold of a 2-D photon-count image."""
+    """Otsu threshold of a 2-D photon-count image.
+
+    Computes Otsu's method (maximize between-class variance) on a 256-bin
+    histogram of finite, positive pixel values.  Returns 0.0 for degenerate
+    images (fewer than 2 positive pixels, or zero total weight).
+
+    Parameters
+    ----------
+    img : np.ndarray
+        2-D float array of photon counts.  Non-finite and non-positive values
+        are excluded before computing the histogram.
+
+    Returns
+    -------
+    float
+        Threshold value.  Pixels >= threshold are considered foreground
+        (cell area).
+
+    Assumptions
+    -----------
+    img should have a bimodal distribution (cells vs background) for Otsu
+    to work well.  Falls back gracefully to 0.0 on degenerate input.
+
+    Examples
+    --------
+    >>> thresh = otsu_threshold(photons)
+    >>> mask = photons >= thresh
+
+    Dependencies
+    ------------
+    numpy
+    """
     flat = img[np.isfinite(img) & (img > 0)].ravel()
     if flat.size < 2:
         return 0.0
@@ -71,12 +102,43 @@ def intensity_mask(
     fallback_frac: float = DEFAULT_MASK_FALLBACK_FRAC,
     blur_sigma: float    = DEFAULT_MASK_BLUR_SIGMA,
 ):
-    """Otsu mask with a top-percentile fallback when Otsu is degenerate.
+    """Boolean intensity mask with Otsu threshold and top-percentile fallback.
 
-    Returns (mask, threshold).  Applies a Gaussian blur (sigma=blur_sigma)
-    before Otsu so the threshold follows cell-level structure rather than
-    per-pixel shot noise.  Falls back to keeping the top fallback_frac
-    fraction of pixels if Otsu keeps <5% or >95%.
+    Applies a Gaussian blur before Otsu so the threshold follows cell-level
+    structure rather than per-pixel shot noise.  Falls back to keeping the
+    top fallback_frac fraction of pixels when Otsu is degenerate (keeps
+    <5% or >95% of pixels).
+
+    Parameters
+    ----------
+    photon_img : np.ndarray
+        2-D float array of photon counts (raw, not blurred).
+    fallback_frac : float, optional
+        Fraction of pixels to retain in the fallback mode.  Default 0.5
+        (top 50%).
+    blur_sigma : float, optional
+        Gaussian blur sigma (pixels) applied before thresholding.
+        Default 2.0.
+
+    Returns
+    -------
+    tuple
+        (mask, threshold) where mask is a bool 2-D ndarray (True = foreground)
+        and threshold is the float photon level used as the cutoff.
+
+    Assumptions
+    -----------
+    photon_img has non-negative values.  Pixels <= 0 do not affect the
+    threshold calculation.
+
+    Examples
+    --------
+    >>> mask, thresh = intensity_mask(photons)
+    >>> print(f'{mask.mean()*100:.1f}% of pixels accepted')
+
+    Dependencies
+    ------------
+    numpy, scipy.ndimage.gaussian_filter, otsu_threshold
     """
     blurred = gaussian_filter(photon_img.astype(float), sigma=blur_sigma)
     thresh  = otsu_threshold(blurred)
@@ -99,9 +161,41 @@ def smooth_phasor(
 ) -> tuple:
     """Photon-weighted Gaussian smoothing of G and S in spatial domain.
 
-    Filters G*photons and photons separately before dividing -- equivalent to
-    averaging the underlying TCSPC decays over a local neighbourhood.
-    Returns (G_sm, S_sm) with NaN where photons == 0 after smoothing.
+    Filters G*photons and photons separately before dividing, which is
+    equivalent to averaging the underlying TCSPC decays over a local
+    neighbourhood.  This preserves the physical meaning of the phasor
+    (it is the phasor of the spatially-averaged decay, not the average
+    of per-pixel phasors).
+
+    Parameters
+    ----------
+    G_cal : np.ndarray
+        2-D calibrated G (real part of phasor), shape (ny, nx).
+    S_cal : np.ndarray
+        2-D calibrated S (imaginary part of phasor), shape (ny, nx).
+    photons : np.ndarray
+        2-D photon count per pixel, same shape as G_cal.
+    sigma : float, optional
+        Gaussian blur radius in pixels.  Default 2.0.
+
+    Returns
+    -------
+    tuple
+        (G_sm, S_sm), each 2-D ndarray.  NaN where the smoothed photon
+        count is zero (i.e. near the image edges or in empty regions).
+
+    Assumptions
+    -----------
+    G_cal, S_cal, and photons must have the same shape.  NaN pixels in
+    G_cal or S_cal are treated as zero contribution (nan_to_num).
+
+    Examples
+    --------
+    >>> G_sm, S_sm = smooth_phasor(G_cal, S_cal, photons, sigma=2.0)
+
+    Dependencies
+    ------------
+    numpy, scipy.ndimage.gaussian_filter
     """
     ph    = np.nan_to_num(photons, nan=0.0)
     G_num = np.nan_to_num(G_cal * photons, nan=0.0)
@@ -119,7 +213,39 @@ def smooth_phasor(
 # ---------------------------------------------------------------------------
 
 def get_time_ns(sdt_obj, n_bins: int) -> np.ndarray:
-    """Return bin-centre times in nanoseconds for a loaded SdtFile."""
+    """Return bin-centre times in nanoseconds for a loaded SdtFile.
+
+    Handles three cases: times array has n_bins+1 edges (compute midpoints),
+    n_bins centres (use as-is), or any other length (fall back to a uniform
+    grid spanning 12.5 ns, the standard TCSPC window at 80 MHz repetition).
+
+    Parameters
+    ----------
+    sdt_obj : sdtfile.SdtFile
+        Loaded .sdt file object (from sdtfile.SdtFile(path)).
+    n_bins : int
+        Expected number of time bins (e.g. 256).  Must match the decay
+        array's last axis length.
+
+    Returns
+    -------
+    np.ndarray
+        1-D array of shape (n_bins,) giving bin-centre times in nanoseconds.
+
+    Assumptions
+    -----------
+    sdt_obj.times[0] exists and can be cast to float.  The 12.5 ns fallback
+    assumes a 80 MHz laser (12.5 ns period); adjust if rep rate differs.
+
+    Examples
+    --------
+    >>> t = get_time_ns(sdt, decay.shape[2])
+    >>> G, S, ph = compute_phasor_raw(decay, t)
+
+    Dependencies
+    ------------
+    numpy, sdtfile (via sdt_obj)
+    """
     t = sdt_obj.times[0].astype(float) * 1e9
     if t.size == n_bins + 1:
         return 0.5 * (t[:-1] + t[1:])
@@ -136,13 +262,41 @@ def compute_phasor_raw(
 ) -> tuple:
     """Compute raw (uncalibrated) G, S, and photon count per pixel.
 
-    Args:
-        decay:       (ny, nx, n_timebins) float
-        time_ns:     (n_timebins,) bin-centre times in ns
-        rep_rate_hz: laser repetition rate (default 80 MHz)
+    G and S are the real and imaginary parts of the first Fourier component
+    of the TCSPC decay at the fundamental frequency (laser rep rate).  They
+    are normalized by photon count so each pixel lies in [0, 1] on the
+    phasor plot.  Apply apply_phasor_cal() to correct for the IRF.
 
-    Returns (G, S, photons) each shape (ny, nx).  G, S are NaN where
-    photons == 0.
+    Parameters
+    ----------
+    decay : np.ndarray
+        3-D float array, shape (ny, nx, n_timebins).  Each [y, x, :] is the
+        TCSPC histogram for that pixel.
+    time_ns : np.ndarray
+        1-D array of bin-centre times in nanoseconds, shape (n_timebins,).
+        Obtain from get_time_ns().
+    rep_rate_hz : float, optional
+        Laser repetition rate in Hz.  Default 80e6 (80 MHz).
+
+    Returns
+    -------
+    tuple
+        (G, S, photons), each shape (ny, nx).  G and S are NaN where the
+        photon count is zero.  photons is the sum over the time axis.
+
+    Assumptions
+    -----------
+    decay values are non-negative (raw photon counts).  time_ns length must
+    match decay.shape[2].
+
+    Examples
+    --------
+    >>> G, S, photons = compute_phasor_raw(decay, get_time_ns(sdt, decay.shape[2]))
+    >>> G_cal, S_cal = apply_phasor_cal(G, S, phase_corr, mod_corr)
+
+    Dependencies
+    ------------
+    numpy
     """
     photons  = decay.sum(axis=2)
     safe_n   = np.where(photons > 0, photons, 1.0)
@@ -162,7 +316,40 @@ def apply_phasor_cal(
     phase_corr: float,
     mod_corr:   float,
 ) -> tuple:
-    """Rotate (by phase_corr) and scale (by mod_corr) raw phasor arrays."""
+    """Rotate (by phase_corr) and scale (by mod_corr) raw phasor arrays.
+
+    Calibration corrects for the instrument response function (IRF) phase
+    shift and modulation depth.  The calibration parameters (phase_corr,
+    mod_corr) are derived in Phase B from a known-lifetime reference
+    (chroma slide) and stored in sdt_metadata_cal.csv.
+
+    Parameters
+    ----------
+    G_raw : np.ndarray
+        2-D raw G (real phasor component) from compute_phasor_raw().
+    S_raw : np.ndarray
+        2-D raw S (imaginary phasor component).
+    phase_corr : float
+        Phase correction in radians (from 'phasor_cal_phase_rad' column).
+    mod_corr : float
+        Modulation correction factor (from 'phasor_cal_mod' column).
+        Values > 1 increase G and S (instrument had lower modulation than
+        the reference).
+
+    Returns
+    -------
+    tuple
+        (G_cal, S_cal), each 2-D ndarray of the same shape as the inputs.
+
+    Examples
+    --------
+    >>> G_cal, S_cal = apply_phasor_cal(
+    ...     G, S, row['phasor_cal_phase_rad'], row['phasor_cal_mod'])
+
+    Dependencies
+    ------------
+    numpy
+    """
     c = np.cos(phase_corr)
     s = np.sin(phase_corr)
     G_cal = mod_corr * (G_raw * c - S_raw * s)
@@ -183,17 +370,46 @@ def draw_semicircle(
     color: str = "gray",
     set_axes: bool = True,
 ):
-    """Draw the universal FLIM semicircle with lifetime tick marks.
+    """Draw the universal FLIM semicircle with lifetime tick marks on a phasor plot.
 
     Single-exponential lifetimes lie on the semicircle from (0,0) to (1,0)
-    through (0.5, 0.5).  G = 1/(1 + (omega*tau)^2), S = omega*tau / (1 + ...).
+    passing through (0.5, 0.5).  Each point is calculated from:
+      G = 1 / (1 + (omega*tau)^2),  S = omega*tau / (1 + (omega*tau)^2)
+    Tick markers are drawn at user-specified lifetime values with annotations.
 
-    Args:
-        ax:              matplotlib Axes.
-        rep_rate_hz:     laser rep rate, defines omega.
-        lifetime_ticks_ns: tau values at which to plot tick markers.
-        lw / alpha / color: semicircle line styling.
-        set_axes:        if True, set xlim/ylim/aspect/grid/xlabel/ylabel.
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        Axes on which to draw.  Should already have calibrated G, S scatter
+        plotted for context.
+    rep_rate_hz : float, optional
+        Laser rep rate defining omega = 2*pi*rep_rate.  Default 80 MHz.
+    lifetime_ticks_ns : tuple of float, optional
+        Tau values (nanoseconds) at which to draw tick markers and labels.
+        Default (0.3, 0.5, 1.0, 2.0, 4.0) ns.
+    lw : float, optional
+        Line width for the semicircle arc.  Default 1.2.
+    alpha : float, optional
+        Opacity for both the arc and tick markers.  Default 0.45.
+    color : str, optional
+        Color for the arc and tick markers.  Default 'gray'.
+    set_axes : bool, optional
+        If True, set xlim=(-0.05, 1.05), ylim=(-0.05, 0.6), aspect='equal',
+        grid, and axis labels 'G'/'S'.  Default True.
+
+    Side Effects
+    ------------
+    Modifies ax in place (adds Line2D, scatter artists, and text annotations).
+
+    Examples
+    --------
+    >>> fig, ax = plt.subplots()
+    >>> ax.scatter(G_cal[mask], S_cal[mask], s=1, alpha=0.3)
+    >>> draw_semicircle(ax)
+
+    Dependencies
+    ------------
+    numpy, matplotlib (via ax)
     """
     theta = np.linspace(0.0, np.pi, 300)
     ax.plot(0.5 + 0.5 * np.cos(theta), 0.5 * np.sin(theta),

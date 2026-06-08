@@ -25,7 +25,28 @@ import matplotlib.pyplot as plt
 # ---------------------------------------------------------------------------
 
 def set2_palette(cell_types: Sequence[str]) -> dict:
-    """Map an ordered list of cell types -> Set2 colors (matches Phase F)."""
+    """Map an ordered list of cell types to Set2 colors (matches Phase F palette).
+
+    Parameters
+    ----------
+    cell_types : sequence of str
+        Ordered list of group labels, e.g. ['KPCWT', 'BKO'].
+
+    Returns
+    -------
+    dict
+        {cell_type: rgba_array} where each value is a length-4 float array
+        from matplotlib's Set2 colormap.
+
+    Examples
+    --------
+    >>> ct_color = set2_palette(['KPCWT', 'BKO'])
+    >>> violin_panel(ax, sub, 'tau_mean_median_ps', ['KPCWT', 'BKO'], ct_color)
+
+    Dependencies
+    ------------
+    numpy, matplotlib.pyplot
+    """
     n = max(len(cell_types), 1)
     set2 = plt.cm.Set2(np.linspace(0, 0.8, n))
     return {ct: set2[i] for i, ct in enumerate(cell_types)}
@@ -51,20 +72,61 @@ def violin_panel(
 ) -> tuple:
     """Violin + jittered scatter with median/extrema lines (matches Phase F style).
 
-    Args:
-        ax:         matplotlib Axes.
-        sub:        DataFrame with `group_col` and `metric`.
-        metric:     numeric column.
-        ct_order:   ordered list of categories to show (e.g. ['KPCWT', 'BKO']).
-        ct_colors:  {category: color}.
-        group_col:  column to group by.
-        min_n:      groups with fewer rows are dropped.
-        jitter:     +/- jitter range on x.
-        point_size: scatter marker size.
-        line_width: linewidth for median/extrema bars.
-        seed:       RNG seed for jitter (reproducible).
+    Draws a violinplot for each group in ct_order that has >= min_n rows,
+    overlaid with jittered scatter points.  Median and extrema bars are
+    drawn in black.  Groups with < min_n rows are silently omitted.
 
-    Returns (cts_here, groups).  groups is a list of value arrays parallel to cts_here.
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        Axes to draw on.
+    sub : pd.DataFrame
+        Data slice; must contain `group_col` and `metric` columns.
+    metric : str
+        Numeric column to plot on the y-axis (e.g. 'tau_mean_median_ps').
+    ct_order : sequence of str
+        Ordered list of group labels; sets x-axis order.
+    ct_colors : dict
+        {group_label: color} for violin fill and scatter points.
+    group_col : str, optional
+        Column that identifies each group.  Default 'cell_type'.
+    min_n : int, optional
+        Minimum number of rows required to draw a violin.  Default 2.
+    jitter : float, optional
+        Half-width of uniform x-jitter for scatter points.  Default 0.07.
+    point_size : float, optional
+        Scatter marker size (matplotlib s units).  Default 22.0.
+    line_width : float, optional
+        Linewidth for median/cbars/cmins/cmaxes.  Default 1.2.
+    seed : int, optional
+        RNG seed for reproducible jitter.  Default 0.
+
+    Returns
+    -------
+    tuple
+        (cts_here, groups) where cts_here is the list of groups actually
+        drawn (subset of ct_order with >= min_n rows) and groups is a
+        parallel list of 1-D value arrays.
+
+    Side Effects
+    ------------
+    Modifies ax in place (adds violin, scatter, and line artists; sets
+    x-tick labels).
+
+    Assumptions
+    -----------
+    NaN values in the metric column are dropped before plotting.
+
+    Examples
+    --------
+    >>> ct_color = set2_palette(['KPCWT', 'BKO'])
+    >>> violin_panel(ax, df_sub, 'tau_mean_median_ps',
+    ...              ['KPCWT', 'BKO'], ct_color)
+    >>> ax.set_ylabel('tau_mean (ps)')
+
+    Dependencies
+    ------------
+    numpy, matplotlib.pyplot
     """
     cts_here = [ct for ct in ct_order if (sub[group_col] == ct).sum() >= min_n]
     groups   = [sub.loc[sub[group_col] == ct, metric].dropna().values for ct in cts_here]
@@ -118,17 +180,45 @@ def show_image_row(
     raw_keys: Iterable[str] = ("photons",),
     fontsize: int = 8,
 ) -> None:
-    """Render one row of image panels with rejected pixels grayed out.
+    """Render one row of image panels with quality-rejected pixels grayed out.
 
-    Args:
-        ax_row:       1-D array of matplotlib Axes; needs len = len(panels) + 1
-                      if include_mask else len(panels).
-        arrs:         dict {param: 2-D ndarray} including 'mask' (bool).
-        panels:       list of (key, cmap_name) tuples.  Defaults to the
-                      photons/tau_mean/a1/a2/a1-over-a2/chi2 canonical set.
-        include_mask: append a final mask panel.
-        raw_keys:     keys NOT to mask out (typically just 'photons').
-        fontsize:     panel title font size.
+    Displays each parameter map at [1st, 99th] percentile contrast.  Pixels
+    outside the quality mask are shown as light gray (using cmap.set_bad).
+    Optionally appends a mask panel showing accepted pixel fraction.
+
+    Parameters
+    ----------
+    ax_row : array-like of matplotlib.axes.Axes
+        1-D array of Axes objects.  Must have length = len(panels) + 1 when
+        include_mask=True, or len(panels) otherwise.
+    arrs : dict
+        {param_name: 2-D ndarray}.  Must include 'mask' (bool array).
+        Typical keys: 'photons', 'tau_mean', 'a1', 'a2', 'a1/a2', 'chi2'.
+        Obtain from load_image_bundle().
+    panels : list of (str, str), optional
+        List of (param_key, colormap_name) pairs to render in order.
+        Defaults to DEFAULT_IMAGE_PANELS (photons/tau_mean/a1/a2/a1_a2/chi2).
+    include_mask : bool, optional
+        If True (default), append a final grayscale panel showing the mask.
+    raw_keys : iterable of str, optional
+        Keys to render without masking (masked pixels shown as-is).
+        Default ('photons',) so photon count is always shown unmasked.
+    fontsize : int, optional
+        Font size for panel titles.  Default 8.
+
+    Side Effects
+    ------------
+    Modifies all Axes in ax_row in place (imshow, colorbar, title, axis off).
+
+    Examples
+    --------
+    >>> arrs, stem = load_image_bundle(row['fit_mask_path'])
+    >>> fig, axes = plt.subplots(1, 7, figsize=(21, 3))
+    >>> show_image_row(axes, arrs)
+
+    Dependencies
+    ------------
+    numpy, matplotlib.pyplot
     """
     panels = panels if panels is not None else DEFAULT_IMAGE_PANELS
     mask   = arrs["mask"]
@@ -180,32 +270,76 @@ def violin_grid(
     suptitle: str | None = None,
     seed: int = 0,
 ):
-    """Grid of violin+scatter panels — rows by `row_by`, cols by `col_by`.
+    """Grid of violin+scatter panels faceted by row_by and col_by columns.
 
-    Each panel is one (row_value, col_value) slice of `df`, with `violin_panel`
-    drawing the inner violin+jitter for groups along the x-axis.
+    Creates a figure with n_rows x n_cols subplots.  Each panel corresponds
+    to one (row_value, col_value) slice of df and calls violin_panel() to
+    draw the within-panel group comparison.
 
-    Args:
-        df:           DataFrame.
-        metric:       numeric column to compare.
-        row_by:       column name for row faceting; None => 1 row.
-        col_by:       column name for col faceting; None => 1 col.
-        group_by:     column distinguishing the two groups within each panel.
-        row_order:    sequence of row_by values to plot, in order; None => sorted unique.
-        col_order:    sequence of col_by values; None => sorted unique.
-        group_order:  ordered list of group labels (required).
-        group_colors: {label: color}; defaults to set2_palette(group_order).
-        figsize_per_panel: (w, h) inches.
-        sharey:       share y-axis across panels.
-        min_n:        a group with < min_n rows is dropped from a panel.
-        title_fmt:    f-string with placeholders {row_v}, {col_v}, {n_str}.
-                      For 1-d grids, the empty axis still substitutes ''.
-        row_label_fmt / col_label_fmt: optional pre-formatters applied to the
-                      row/col value before substitution (e.g. "{:.0f} nm").
-        suptitle:     figure title.
-        seed:         RNG seed for jitter (forwarded to violin_panel).
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Full analysis DataFrame (will be filtered per panel).
+    metric : str
+        Numeric column to compare across groups (e.g. 'tau_mean_median_ps').
+    row_by : str, optional
+        Column for row faceting (e.g. 'fixation_type').  None => 1 row.
+    col_by : str, optional
+        Column for column faceting (e.g. 'em_filter_nm').  None => 1 col.
+    group_by : str, optional
+        Column distinguishing the x-axis groups within each panel.
+        Default 'cell_type'.
+    row_order : sequence, optional
+        Ordered row_by values; None => sorted unique.
+    col_order : sequence, optional
+        Ordered col_by values; None => sorted unique.
+    group_order : sequence
+        Ordered group labels (required).  Sets x-axis order in every panel.
+    group_colors : dict, optional
+        {group_label: color}; defaults to set2_palette(group_order).
+    figsize_per_panel : tuple of float, optional
+        (width, height) in inches per panel.  Default (4, 4).
+    sharey : bool, optional
+        Share the y-axis scale across all panels.  Default True.
+    min_n : int, optional
+        Groups with fewer rows are omitted from that panel.  Default 2.
+    title_fmt : str, optional
+        f-string for panel titles.  Placeholders: {row_v}, {col_v}, {n_str}
+        (n_str is 'KPCWT:N  BKO:N').  For 1-D grids the unused value is ''.
+    row_label_fmt : str, optional
+        Format string applied to each row_by value before title substitution,
+        e.g. '{:.0f}' to render a float as an integer.
+    col_label_fmt : str, optional
+        Format string applied to each col_by value.
+    suptitle : str, optional
+        Figure super-title.
+    seed : int, optional
+        RNG seed forwarded to violin_panel for reproducible jitter.
 
-    Returns (fig, axes).  axes is always 2-D so callers can index axes[ri][ci].
+    Returns
+    -------
+    tuple
+        (fig, axes) where axes is always 2-D (shape n_rows x n_cols) so
+        callers can safely index axes[ri][ci].
+
+    Side Effects
+    ------------
+    Creates and shows a matplotlib Figure.
+
+    Examples
+    --------
+    >>> fig, axes = violin_grid(
+    ...     df_analysis, 'tau_mean_median_ps',
+    ...     row_by='fixation_type', col_by='em_filter_nm',
+    ...     row_order=['form', 'live'], col_order=[457, 535],
+    ...     group_order=['KPCWT', 'BKO'],
+    ...     col_label_fmt='{:.0f} nm',
+    ...     suptitle='tau_mean by fixation and channel',
+    ... )
+
+    Dependencies
+    ------------
+    numpy, matplotlib.pyplot, violin_panel, set2_palette
     """
     if group_colors is None:
         group_colors = set2_palette(group_order)
@@ -284,9 +418,47 @@ def show_photons_grid(
 ) -> None:
     """Plot a grid of photon-intensity thumbnails for an image-level subset.
 
-    Expects each row to have a column with the path to the *_fit_mask.npy
-    file; the photons map is loaded from the same folder by replacing the
-    suffix with _photons.asc.
+    Each thumbnail is a raw photon-count image displayed at [1st, 99th]
+    percentile contrast.  The photon .asc is located by replacing
+    '_fit_mask.npy' with '_photons.asc' in the mask path column.
+
+    Parameters
+    ----------
+    subset : pd.DataFrame
+        Rows to display.  Must have columns for mask path, filename,
+        cell_type, and date (see parameter names below).
+    mask_path_col : str, optional
+        Column containing the _fit_mask.npy path.  Default 'fit_mask_path'.
+    filename_col : str, optional
+        Column with the .sdt filename for the panel title.  Default 'filename'.
+    cell_type_col : str, optional
+        Column with the cell type label.  Default 'cell_type'.
+    date_col : str, optional
+        Column with a datetime (or string) for the title.  Default 'date'.
+    ncols : int, optional
+        Number of thumbnail columns in the grid.  Default 4.
+    title : str, optional
+        Super-title for the figure.  Default ''.
+    wrap_filename : int, optional
+        Max characters per line when wrapping long filenames.  Default 55.
+
+    Side Effects
+    ------------
+    Creates and shows a matplotlib Figure via plt.show().
+
+    Assumptions
+    -----------
+    _photons.asc must exist alongside each _fit_mask.npy file.  Rows where
+    the .asc is missing are shown as a 'no .asc' placeholder.
+
+    Examples
+    --------
+    >>> show_photons_grid(filter_subset(df, fixation_type='form', em_filter_nm=457),
+    ...                   title='form 457 nm -- all images')
+
+    Dependencies
+    ------------
+    numpy, matplotlib.pyplot, textwrap
     """
     n = len(subset)
     if n == 0:

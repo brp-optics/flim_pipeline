@@ -63,16 +63,42 @@ DEFAULT_PREFERRED_N_COMP = {"glu": 3, "form": 2, "live": 2}
 
 def _parse_bin_radius(key: str) -> int:
     """Parse bin radius from a fit_set_key, e.g. 'fitet-sz-c2-b10' -> 10.
-    Returns 0 if no '-b<digits>' token is found.
+
+    Parameters
+    ----------
+    key : str
+        A fit_set_key string (or just the rel_dir component).
+
+    Returns
+    -------
+    int
+        Bin radius b; returns 0 if no '-b<digits>' token is found.
+
+    Dependencies
+    ------------
+    re
     """
     m = re.search(r"[-_]b(\d+)", str(key), re.IGNORECASE)
     return int(m.group(1)) if m else 0
 
 
 def _prefer_shift_zero(candidates) -> str:
-    """Among candidate rows (DataFrame with 'fit_set_key' column), return the
-    fit_set_key of the shift-zero ('-sz-') folder if one exists; otherwise
-    return the first row.
+    """Among candidate rows, prefer the shift-zero ('-sz-') folder if present.
+
+    Parameters
+    ----------
+    candidates : pd.DataFrame
+        Subset of fit_map_df with a 'fit_set_key' column.  Must be non-empty.
+
+    Returns
+    -------
+    str
+        fit_set_key of the shift-zero row, or the first row if no shift-zero
+        row exists.
+
+    Dependencies
+    ------------
+    pandas
     """
     sz_rows = candidates[
         candidates["fit_set_key"].str.contains("-sz-", case=False, na=False)
@@ -87,17 +113,44 @@ def best_fit_key(
     fixation_type: str | None = None,
     preferred_n_comp: dict | None = None,
 ) -> str | None:
-    """Return the highest-bin fit_set_key matching the hard constraints:
-       n_components == preferred_n_comp[fixation_type]  AND  shift-zero folder.
+    """Return the highest-bin fit_set_key matching two hard constraints.
 
-    Returns None if no fit satisfies both constraints.
+    Constraints (both must be satisfied):
+      1. n_components == preferred_n_comp[fixation_type]
+         (default: glu->3, form->2, live->2)
+      2. Shift-zero folder ('-sz-' in fit_set_key)
 
-    Args:
-        filename:         the .sdt filename to find a fit for.
-        fit_map_df:       DataFrame with columns 'sdt_filename', 'fit_set_key',
-                          'n_components'.
-        fixation_type:    'glu' | 'form' | 'live' (selects preferred n_comp).
-        preferred_n_comp: override for DEFAULT_PREFERRED_N_COMP.
+    Among candidates satisfying both, returns the one with the largest bin
+    radius b (most spatial averaging, used as the primary fit per image).
+
+    Parameters
+    ----------
+    filename : str
+        .sdt filename (basename, no directory) to look up.
+    fit_map_df : pd.DataFrame
+        DataFrame with columns 'sdt_filename', 'fit_set_key', and optionally
+        'n_components'.
+    fixation_type : str, optional
+        'glu', 'form', or 'live'.  If None, the n_components constraint
+        is skipped.
+    preferred_n_comp : dict, optional
+        Override for DEFAULT_PREFERRED_N_COMP ({fixation_type: n_comp}).
+
+    Returns
+    -------
+    str or None
+        Best-match fit_set_key, or None if no fit satisfies both constraints.
+
+    Examples
+    --------
+    >>> key = best_fit_key(row['filename'], fit_map_df,
+    ...                    fixation_type=row['fixation_type'])
+    >>> if key:
+    ...     fd = load_asc_fit_set(*fit_dir_from_key(key, data_dirs)[:2])
+
+    Dependencies
+    ------------
+    pandas, _parse_bin_radius
     """
     pref = preferred_n_comp if preferred_n_comp is not None else DEFAULT_PREFERRED_N_COMP
 
@@ -134,17 +187,70 @@ def compute_fit_mask(
     tau_mean_bounds: dict | None = None,
     taumean_cfg: dict | None = None,
 ) -> tuple:
-    """Combine 5 quality criteria into one boolean mask.
+    """Combine 5 quality criteria into one boolean pixel mask.
 
-    Criteria (must all pass):
+    A pixel passes only if all five criteria are satisfied.  Used in Phase E
+    to generate the _fit_mask.npy saved alongside each fit set.
+
+    Criteria (all must pass):
       1. Box-kernel smoothed photon count >= min_photons_by_ncomp[n_components]
+         (smoothing uses a uniform box of size (2*b_val+1)^2)
       2. chi^2 in [chi2_lo, chi2_hi]
-      3. All amplitude components >= 0 and their sum > 0
-      4. Tau components within tau_bounds[fixation_type]
-      5. amplitude-weighted tau_mean within tau_mean_bounds[fixation_type]
-         (if set; otherwise skipped)
+      3. All amplitude components (a1, a2, a3 if present) >= 0 and sum > 0
+      4. Each tau component within tau_bounds[fixation_type]
+      5. Amplitude-weighted tau_mean within tau_mean_bounds[fixation_type]
+         (criterion skipped when tau_mean_bounds[fixation_type] is None)
 
-    Returns (mask_final, breakdown_dict).
+    Parameters
+    ----------
+    fd : dict
+        {param_name: 2-D ndarray} from load_asc_fit_set().  Expected keys
+        depend on fixation_type (e.g. a1, a2, tau1, tau2, chi2, photons).
+    fixation_type : str
+        'glu', 'form', or 'live'.  Selects tau_bounds and tau_mean_bounds.
+    b_val : int
+        Binning radius used in SPCImage fit.  Determines smoothing kernel
+        size (2*b_val+1)^2 for the photon criterion.
+    sdt_photons : np.ndarray, optional
+        Raw photon count from the .sdt file.  Used for criterion 1 when
+        'photons' is absent from fd.
+    n_components : int, optional
+        Number of exponential components (selects min_photons threshold).
+        If None, the 'None' key of min_photons_by_ncomp is used.
+    min_photons_by_ncomp : dict, optional
+        Override for DEFAULT_MIN_PHOTONS_BY_NCOMP.
+    chi2_lo, chi2_hi : float, optional
+        Chi-squared acceptance range.  Defaults 0.8 and 2.0.
+    tau_bounds : dict, optional
+        Override for DEFAULT_TAU_BOUNDS.
+    tau_mean_bounds : dict, optional
+        Override for DEFAULT_TAU_MEAN_BOUNDS.
+    taumean_cfg : dict, optional
+        Override for DEFAULT_TAUMEAN_CFG (component pairs for tau_mean).
+
+    Returns
+    -------
+    tuple
+        (mask_final, breakdown) where mask_final is a bool 2-D ndarray and
+        breakdown is a dict with keys:
+          n_total, n_photon_ok, n_chi2_ok, n_amp_ok, n_tau_ok,
+          n_taumean_ok, n_final, pct_final.
+
+    Assumptions
+    -----------
+    All arrays in fd must be 2-D and the same shape.  Shape is inferred
+    from the first 2-D array found.  Returns (zeros(1,1), {}) if no 2-D
+    array is present.
+
+    Examples
+    --------
+    >>> mask, brk = compute_fit_mask(fd, 'form', b_val=2, n_components=2)
+    >>> print(f'{brk["pct_final"]:.1f}% of pixels passed')
+    >>> np.save('myfile_fit_mask.npy', mask)
+
+    Dependencies
+    ------------
+    numpy, scipy.ndimage.uniform_filter, compute_tau_mean
     """
     mph_cfg = (min_photons_by_ncomp
                if min_photons_by_ncomp is not None else DEFAULT_MIN_PHOTONS_BY_NCOMP)

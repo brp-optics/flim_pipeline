@@ -244,12 +244,14 @@ ANALYSIS_SHIFT_GROUP = {
 MAX_POCKELS = 0.25
 
 # Z-stack first-slice filter.
-# OpenScan saves one .sdt file per shutter close (one per z-step), so the
-# frame_index column encodes z-stack depth (0 = first slice, 1 = second, ...).
-# When True, live acquisitions are restricted to frame_index=0 so each
-# physical position contributes exactly one data point.
-# Set False to include all z-slices.
+# ONLY session 20260501_KPC_fixed_dishes_on_SLIM used live-cell z-stacks where
+# frame_index encodes z-depth (0 = first slice, 1 = second, ...).
+# All other sessions use multidimensional acquisition where frame_index encodes
+# a different physical position -- each frame_index is an independent field of
+# view and must NOT be filtered out.
+# When True, the filter is applied only to 20260501 live rows.
 LIVE_FIRST_FRAME_ONLY = True
+LIVE_ZSTACK_SESSION = "20260501_KPC_fixed_dishes_on_SLIM"
 
 # Sessions to exclude from specific fixation types.
 # Format: {session_root_prefix: [fixation_type, ...]} or {session_root_prefix: None} to
@@ -469,17 +471,21 @@ elif "pockels" not in df_analysis.columns:
     print("  WARNING: pockels column not found - MAX_POCKELS filter skipped.")
 
 # -- Z-stack first-slice filter -----------------------------------------------
-# Restricts LIVE acquisitions to frame_index=0 (first z-slice) so each
-# physical position contributes exactly one row.  Form and glu acquisitions
-# are single focal planes and are not filtered.
+# Restricts LIVE acquisitions in LIVE_ZSTACK_SESSION to frame_index=0 so each
+# physical position contributes exactly one row.  All other sessions use
+# multidimensional acquisition where frame_index = position index (independent
+# fields of view) and must NOT be filtered.
 if LIVE_FIRST_FRAME_ONLY and "frame_index" in df_analysis.columns:
-    _live_mask = df_analysis["fixation_type"] == "live"
-    _n_frames_drop = (_live_mask & (df_analysis["frame_index"] > 0)).sum()
+    _zstack_live_mask = (
+        (df_analysis["fixation_type"] == "live") &
+        (df_analysis["session_root"] == LIVE_ZSTACK_SESSION)
+    )
+    _n_frames_drop = (_zstack_live_mask & (df_analysis["frame_index"] > 0)).sum()
     if _n_frames_drop:
         print(f"  frame_index filter: dropped {_n_frames_drop} live rows"
-              f" with frame_index > 0 (z-slice >= 1)")
+              f" with frame_index > 0 from {LIVE_ZSTACK_SESSION} (z-slices >= 1)")
     df_analysis = df_analysis[
-        ~_live_mask | (df_analysis["frame_index"] == 0)
+        ~_zstack_live_mask | (df_analysis["frame_index"] == 0)
     ].copy()
 elif LIVE_FIRST_FRAME_ONLY and "frame_index" not in df_analysis.columns:
     print("  WARNING: frame_index column not found - LIVE_FIRST_FRAME_ONLY filter skipped.")
@@ -1736,6 +1742,392 @@ _fig4.suptitle("amp ratio  --  live, colony_deep only  (shift=0, 2-comp)",
 plt.tight_layout()
 _savefig(_fig4, "fig_amp_live_deep_only")
 plt.show()
+
+# %% [markdown]
+# ## Part 3: Colony-edge live 457 nm -- KPCWT vs BKO violin
+#
+# For each metric (tau_mean, amp_ratio) produces a 1x2 figure:
+#   Left panel  -- overall violin, points colored by cell type (standard style)
+#   Right panel -- same violin (gray bodies), points colored by imaging session
+#                  to reveal whether any apparent group difference is session-driven
+#
+# Requires:
+#   - position_annotation.csv loaded (df_analysis has 'position_annotation' column)
+#   - ct_color and ct_present defined in Step 21
+
+# %%
+from utils.helpers import violin_panel as _vp
+
+_P3_CT_ORDER = [ct for ct in ["KPCWT", "BKO"] if ct in ct_present]
+
+if "position_annotation" not in df_analysis.columns:
+    print("WARNING: position_annotation column not found -- "
+          "run the Step 19 load block first")
+else:
+    _CE = df_analysis[
+        (df_analysis["fixation_type"] == "live") &
+        (df_analysis["em_filter_nm"] == 457) &
+        (df_analysis["position_annotation"] == "colony_edge")
+    ].copy()
+
+    _n_kpc = (_CE["cell_type"] == "KPCWT").sum()
+    _n_bko = (_CE["cell_type"] == "BKO").sum()
+    print(f"colony_edge / live / 457 nm  KPCWT n={_n_kpc}  BKO n={_n_bko}")
+    print(_CE.groupby(["session_root", "cell_type"]).size().to_string())
+
+    # ---- Recompute per-image metrics with Otsu foreground mask ---------------
+    # fit_analysis_summary.csv used only the Phase E quality mask (chi2, photon
+    # floor, etc.).  Background pixels that survived quality filtering still bias
+    # the per-image medians toward shorter tau_mean and distorted amp ratios.
+    # Here we AND each image's quality mask with an Otsu foreground mask derived
+    # from the blurred photon image, then recompute tau_mean_median_ps and
+    # amp_ratio_median in-place so all downstream cells use corrected values.
+    if "fit_mask_path" not in _CE.columns:
+        print("  WARNING: fit_mask_path missing -- keeping original metrics")
+    else:
+        from src.io import load_image_bundle as _lib_ce
+        from src.phasor import intensity_mask as _imask_ce
+        _n_ce = len(_CE)
+        _new_tau, _new_ratio = {}, {}
+        print(f"  Recomputing metrics with Otsu mask for {_n_ce} images ...")
+        for _i, (_idx, _r) in enumerate(_CE.iterrows()):
+            try:
+                _a, _ = _lib_ce(_r["fit_mask_path"])
+                _om, _ = _imask_ce(_a["photons"])
+                _cm = _a["mask"] & _om
+                _tv = _a["tau_mean"][_cm & np.isfinite(_a["tau_mean"])]
+                _new_tau[_idx]   = float(np.median(_tv)) if _tv.size > 0 else np.nan
+                _rv = _a["a1/a2"][_cm & np.isfinite(_a["a1/a2"])]
+                _new_ratio[_idx] = float(np.median(_rv)) if _rv.size > 0 else np.nan
+            except Exception as _recomp_err:
+                _new_tau[_idx] = _new_ratio[_idx] = np.nan
+            if (_i + 1) % 10 == 0 or (_i + 1) == _n_ce:
+                print(f"    {_i + 1}/{_n_ce}")
+        _CE["tau_mean_median_ps"] = pd.Series(_new_tau)
+        _CE["amp_ratio_median"]   = pd.Series(_new_ratio)
+        print(f"  Done.  tau_mean range: "
+              f"{_CE['tau_mean_median_ps'].min():.0f}--"
+              f"{_CE['tau_mean_median_ps'].max():.0f} ps  |  "
+              f"amp_ratio range: "
+              f"{_CE['amp_ratio_median'].min():.2f}--"
+              f"{_CE['amp_ratio_median'].max():.2f}")
+
+    # Session color palette (tab10, date-prefix labels)
+    _ce_sessions = sorted(_CE["session_root"].dropna().unique())
+    _ce_sess_cmap = plt.cm.tab10(np.linspace(0, 0.9, max(len(_ce_sessions), 1)))
+    _ce_sess_color = {s: _ce_sess_cmap[i] for i, s in enumerate(_ce_sessions)}
+    _ce_sess_handles = [
+        mpatches.Patch(color=_ce_sess_color[s], label=s.split("_")[0])
+        for s in _ce_sessions
+    ]
+
+    def _p3_session_panel(ax, sub, metric, ct_order):
+        """Right-hand panel: gray violins + session-colored scatter."""
+        rng = np.random.default_rng(seed=42)
+        for j, ct in enumerate(ct_order):
+            vals = sub.loc[sub["cell_type"] == ct, metric].dropna().values
+            if len(vals) >= 2:
+                parts = ax.violinplot([vals], positions=[j],
+                                      showmedians=True, showextrema=True)
+                for pc in parts["bodies"]:
+                    pc.set_facecolor("0.80")
+                    pc.set_alpha(0.55)
+                for k in ("cmedians", "cbars", "cmins", "cmaxes"):
+                    if k in parts:
+                        parts[k].set_color("0.35")
+                        parts[k].set_linewidth(1.2)
+            elif len(vals) == 1:
+                ax.plot(j, vals[0], "o", color="0.5", ms=8, zorder=4)
+            for sess in _ce_sessions:
+                sv = sub[(sub["cell_type"] == ct) &
+                         (sub["session_root"] == sess)][metric].dropna().values
+                if len(sv) == 0:
+                    continue
+                jit = rng.uniform(-0.07, 0.07, len(sv))
+                ax.scatter(j + jit, sv, s=22,
+                           color=_ce_sess_color[sess],
+                           alpha=0.85, zorder=5)
+        ax.set_xticks(range(len(ct_order)))
+        ax.set_xticklabels(ct_order, fontsize=10)
+
+    _suptitle_base = f"Colony edge, live, 457 nm  (KPCWT n={_n_kpc}, BKO n={_n_bko})"
+
+    # --- Figure 1: tau_mean ---------------------------------------------------
+    _fig_tm, _axes_tm = plt.subplots(1, 2, figsize=(9, 4), sharey=True)
+
+    _vp(_axes_tm[0], _CE, "tau_mean_median_ps", _P3_CT_ORDER, ct_color)
+    _axes_tm[0].set_ylabel("tau_mean (ps)")
+    _axes_tm[0].set_title("overall")
+
+    _p3_session_panel(_axes_tm[1], _CE, "tau_mean_median_ps", _P3_CT_ORDER)
+    _axes_tm[1].set_title("by session")
+    _axes_tm[1].legend(handles=_ce_sess_handles, fontsize=7,
+                       title="session", bbox_to_anchor=(1.02, 1), loc="upper left")
+
+    _fig_tm.suptitle(f"tau mean  --  {_suptitle_base}", fontsize=11)
+    _fig_tm.tight_layout()
+    _savefig(_fig_tm, "fig_colony_edge_live_457_taumean")
+    plt.show()
+
+    # --- Figure 2: amp_ratio --------------------------------------------------
+    _fig_ar, _axes_ar = plt.subplots(1, 2, figsize=(9, 4), sharey=True)
+
+    _vp(_axes_ar[0], _CE, "amp_ratio_median", _P3_CT_ORDER, ct_color)
+    _axes_ar[0].set_ylabel("a1 / a2")
+    _axes_ar[0].set_title("overall")
+
+    _p3_session_panel(_axes_ar[1], _CE, "amp_ratio_median", _P3_CT_ORDER)
+    _axes_ar[1].set_title("by session")
+    _axes_ar[1].legend(handles=_ce_sess_handles, fontsize=7,
+                       title="session", bbox_to_anchor=(1.02, 1), loc="upper left")
+
+    _fig_ar.suptitle(f"amp ratio (a1/a2)  --  {_suptitle_base}", fontsize=11)
+    _fig_ar.tight_layout()
+    _savefig(_fig_ar, "fig_colony_edge_live_457_ampratio")
+    plt.show()
+
+# %% [markdown]
+# ## Part 3b: Colony-edge live 457 nm -- per-session breakdown (2x3 grid)
+#
+# Upper-left panel: all sessions combined.
+# Remaining five panels: one per imaging session (in acquisition order).
+# Points colored by cell type throughout.  Shared y-axis so panels are
+# directly comparable.  Produced for both tau_mean and amp_ratio.
+
+# %%
+if "position_annotation" in df_analysis.columns and "_CE" in dir():
+    def _p3b_grid(metric, ylabel, fname_suffix):
+        # "all" + one panel per session -> 6 panels in a 2x3 grid
+        _panels = [("all", _CE)] + [
+            (s.split("_")[0], _CE[_CE["session_root"] == s])
+            for s in _ce_sessions
+        ]
+        _fig, _axes = plt.subplots(2, 3, figsize=(12, 8),
+                                   sharey=True, sharex=False)
+        _ax_flat = _axes.ravel()
+
+        for _idx, (label, sub) in enumerate(_panels):
+            _ax = _ax_flat[_idx]
+            _n_kpc_p = (sub["cell_type"] == "KPCWT").sum()
+            _n_bko_p = (sub["cell_type"] == "BKO").sum()
+            _vp(_ax, sub, metric, _P3_CT_ORDER, ct_color)
+            _ax.set_title(f"{label}\nKPCWT n={_n_kpc_p}  BKO n={_n_bko_p}",
+                          fontsize=9)
+            if _idx % 3 == 0:
+                _ax.set_ylabel(ylabel)
+
+        # Hide the unused 6th panel if there are fewer than 5 sessions
+        for _idx in range(len(_panels), 6):
+            _ax_flat[_idx].set_visible(False)
+
+        _fig.suptitle(
+            f"{ylabel}  --  colony edge, live, 457 nm  (per session)",
+            fontsize=12,
+        )
+        _fig.tight_layout()
+        _savefig(_fig, f"fig_colony_edge_live_457_{fname_suffix}_persession")
+        plt.show()
+
+    _p3b_grid("tau_mean_median_ps", "tau_mean (ps)", "taumean")
+    _p3b_grid("amp_ratio_median",   "a1 / a2",       "ampratio")
+
+# %% [markdown]
+# ## Part 3c: Representative images -- median tau_mean image per session
+#
+# For each session, picks the KPCWT and BKO image whose tau_mean_median_ps is
+# closest to that session+cell_type group median, then calls show_image_row()
+# for each.  Rows are ordered (session0 KPCWT, session0 BKO, session1 KPCWT, ...)
+# so each KPCWT/BKO pair is adjacent.  Each row shows all standard panels:
+# photons / tau_mean / a1 / a2 / a1_a2 / chi2 / mask.
+
+# %%
+if "position_annotation" in df_analysis.columns and "_CE" in dir():
+    from src.io import load_image_bundle as _lib
+    from src.phasor import intensity_mask as _imask
+    from utils.helpers import show_image_row as _sir, DEFAULT_IMAGE_PANELS as _DIP
+
+    _P3C_METRIC   = "tau_mean_median_ps"
+    _P3C_CT_ORDER = ["KPCWT", "BKO"]
+
+    def _pick_median_row(sub_df, metric):
+        """Row in sub_df whose metric value is closest to the sub-group median."""
+        valid = sub_df.dropna(subset=[metric])
+        if valid.empty:
+            return None
+        med = valid[metric].median()
+        return valid.loc[(valid[metric] - med).abs().idxmin()]
+
+    if "fit_mask_path" not in _CE.columns:
+        print("WARNING: fit_mask_path column missing -- cannot display images.")
+        print("  Verify that filepath_map.csv was joined in the load block.")
+    else:
+        # ---- select and load one image per (session, ct) --------------------
+        # Row order: (sess0 KPCWT, sess0 BKO, sess1 KPCWT, sess1 BKO, ...)
+        _p3c_rows = []   # list of (sess_label, ct, df_row, arrs | None)
+
+        for _sess in _ce_sessions:
+            for _ct in _P3C_CT_ORDER:
+                _sub  = _CE[
+                    (_CE["cell_type"] == _ct) & (_CE["session_root"] == _sess)
+                ]
+                _row  = _pick_median_row(_sub, _P3C_METRIC)
+                _slbl = _sess.split("_")[0]
+                if _row is None:
+                    _p3c_rows.append((_slbl, _ct, None, None))
+                    continue
+                try:
+                    _arrs, _ = _lib(_row["fit_mask_path"])
+                    # AND quality mask with Otsu foreground mask on photons
+                    _otsu_mask, _otsu_thresh = _imask(_arrs["photons"])
+                    _n_before = int(_arrs["mask"].sum())
+                    _combined = _arrs["mask"] & _otsu_mask
+                    _n_after  = int(_combined.sum())
+                    print(f"  {_slbl} {_ct}: Otsu thresh={_otsu_thresh:.0f} ph,"
+                          f" mask {_n_before} -> {_n_after} px"
+                          f" ({100*_n_after/_n_before:.0f}% retained)")
+                    _arrs = dict(_arrs, mask=_combined)
+                    _p3c_rows.append((_slbl, _ct, _row, _arrs))
+                except Exception as _load_err:
+                    print(f"  load error  {_ct} / {_slbl}: {_load_err}")
+                    _p3c_rows.append((_slbl, _ct, _row, None))
+
+        # ---- draw: one show_image_row per entry -----------------------------
+        _N_PANELS   = len(_DIP) + 1          # 6 param panels + mask = 7
+        _n_img_rows = len(_p3c_rows)         # 10 rows (5 sessions x 2 cell types)
+
+        _fig_imgs, _axes_imgs = plt.subplots(
+            _n_img_rows, _N_PANELS,
+            figsize=(2.6 * _N_PANELS, 2.8 * _n_img_rows),
+            squeeze=False,
+        )
+
+        for _ir, (_slbl, _ct, _row, _arrs) in enumerate(_p3c_rows):
+            _ax_row = _axes_imgs[_ir]
+
+            if _arrs is None:
+                for _ax in _ax_row:
+                    _ax.text(0.5, 0.5, "no data", ha="center", va="center",
+                             transform=_ax.transAxes, fontsize=9, color="0.5")
+                    _ax.axis("off")
+                _ax_row[0].set_title(f"{_slbl}  {_ct}\n(no data)", fontsize=7)
+                continue
+
+            _sir(_ax_row, _arrs, fontsize=7)
+
+            # Overwrite the first panel title with session + cell type info
+            _this_val  = _row[_P3C_METRIC]
+            _sess_med  = _CE[
+                (_CE["cell_type"] == _ct) & (_CE["session_root"] == _sess)
+            ][_P3C_METRIC].median()
+            _n_sub = (
+                (_CE["cell_type"] == _ct) & (_CE["session_root"] == _sess)
+            ).sum()
+            _ax_row[0].set_title(
+                f"{_slbl}  {_ct}\ntau={_this_val:.0f} ps  (med={_sess_med:.0f}, n={_n_sub})",
+                fontsize=7,
+            )
+
+        _fig_imgs.suptitle(
+            "Median tau_mean image per session  --  colony edge, live, 457 nm",
+            fontsize=12,
+        )
+        _fig_imgs.tight_layout()
+        _savefig(_fig_imgs, "fig_colony_edge_live_457_median_images")
+        plt.show()
+
+# %% [markdown]
+# ## Part 3d: Colony-edge live 457 nm -- KPCWT vs BKO violin, colored by dish
+#
+# Dish is identified by the filename prefix up to (but not including) "_live"
+# or "live" when it runs together with the sample name.  This captures all
+# observed formats: "10_KPCWT_145uL", "4_BKO_P10_3", "3_BKOCO2".
+# Combined with the session date to make globally unique dish keys.
+
+# %%
+if "_CE" in dir() and "filename" in _CE.columns:
+    import re as _re
+
+    def _parse_dish_key(filename, session_root):
+        """Stem of filename up to '_?live', prefixed with the session date."""
+        m = _re.match(r'^(.+?)_?live_', str(filename))
+        stem = m.group(1) if m else _re.sub(r'_\d{4}\.sdt$', '', str(filename))
+        return f"{session_root.split('_')[0]}_{stem}"
+
+    _CE["dish_key"] = _CE.apply(
+        lambda r: _parse_dish_key(r["filename"], r["session_root"]), axis=1
+    )
+
+    _dishes      = sorted(_CE["dish_key"].dropna().unique())
+    _n_dishes    = len(_dishes)
+    _dish_colors = [plt.cm.tab20(i / max(_n_dishes - 1, 1)) for i in range(_n_dishes)]
+    _dish_color  = dict(zip(_dishes, _dish_colors))
+    _dish_handles = [
+        mpatches.Patch(color=_dish_color[d], label=d)
+        for d in _dishes
+    ]
+    print(f"Unique dishes in _CE: {_n_dishes}")
+    print(_CE.groupby(["cell_type", "dish_key"]).size().to_string())
+
+    def _p3d_dish_panel(ax, sub, metric, ct_order):
+        """Gray violin bodies with each point colored by dish."""
+        rng = np.random.default_rng(seed=42)
+        for j, ct in enumerate(ct_order):
+            vals = sub.loc[sub["cell_type"] == ct, metric].dropna().values
+            if len(vals) >= 2:
+                parts = ax.violinplot([vals], positions=[j],
+                                      showmedians=True, showextrema=True)
+                for pc in parts["bodies"]:
+                    pc.set_facecolor("0.80"); pc.set_alpha(0.55)
+                for k in ("cmedians", "cbars", "cmins", "cmaxes"):
+                    if k in parts:
+                        parts[k].set_color("0.35"); parts[k].set_linewidth(1.2)
+            elif len(vals) == 1:
+                ax.plot(j, vals[0], "o", color="0.5", ms=8, zorder=4)
+            for dish in _dishes:
+                dv = sub[
+                    (sub["cell_type"] == ct) & (sub["dish_key"] == dish)
+                ][metric].dropna().values
+                if len(dv) == 0:
+                    continue
+                jit = rng.uniform(-0.07, 0.07, len(dv))
+                ax.scatter(j + jit, dv, s=22, color=_dish_color[dish],
+                           alpha=0.85, zorder=5)
+        ax.set_xticks(range(len(ct_order)))
+        ax.set_xticklabels(ct_order, fontsize=10)
+
+    _suptitle_base = (
+        f"Colony edge, live, 457 nm  "
+        f"(KPCWT n={(_CE['cell_type']=='KPCWT').sum()}, "
+        f"BKO n={(_CE['cell_type']=='BKO').sum()})"
+    )
+    _legend_kw = dict(
+        handles=_dish_handles, fontsize=6, title="dish",
+        bbox_to_anchor=(1.02, 1), loc="upper left", ncol=2,
+    )
+
+    # Figure 1: tau_mean
+    _fig_td, _axes_td = plt.subplots(1, 2, figsize=(10, 4), sharey=True)
+    _vp(_axes_td[0], _CE, "tau_mean_median_ps", _P3_CT_ORDER, ct_color)
+    _axes_td[0].set_ylabel("tau_mean (ps)"); _axes_td[0].set_title("overall")
+    _p3d_dish_panel(_axes_td[1], _CE, "tau_mean_median_ps", _P3_CT_ORDER)
+    _axes_td[1].set_title("by dish")
+    _axes_td[1].legend(**_legend_kw)
+    _fig_td.suptitle(f"tau mean  --  {_suptitle_base}", fontsize=11)
+    _fig_td.tight_layout()
+    _savefig(_fig_td, "fig_colony_edge_live_457_taumean_bydish")
+    plt.show()
+
+    # Figure 2: amp_ratio
+    _fig_ad, _axes_ad = plt.subplots(1, 2, figsize=(10, 4), sharey=True)
+    _vp(_axes_ad[0], _CE, "amp_ratio_median", _P3_CT_ORDER, ct_color)
+    _axes_ad[0].set_ylabel("a1 / a2"); _axes_ad[0].set_title("overall")
+    _p3d_dish_panel(_axes_ad[1], _CE, "amp_ratio_median", _P3_CT_ORDER)
+    _axes_ad[1].set_title("by dish")
+    _axes_ad[1].legend(**_legend_kw)
+    _fig_ad.suptitle(f"amp ratio (a1/a2)  --  {_suptitle_base}", fontsize=11)
+    _fig_ad.tight_layout()
+    _savefig(_fig_ad, "fig_colony_edge_live_457_ampratio_bydish")
+    plt.show()
 
 # %%
 import winsound as _ws, time as _t

@@ -29,14 +29,60 @@ DATA_DIRS_PATH       = _CONFIG_DIR / "data_dirs.yaml"
 
 
 def load_config(path: Path | str | None = None) -> dict:
-    """Load config/default.yaml and normalize types.
+    """Load config/default.yaml and normalize types to what the library expects.
+
+    YAML lists become tuples and the string key 'default' becomes None so
+    that downstream functions can use dict lookups without further conversion.
 
     Conversions applied:
-      min_photons_by_ncomp:  int / 'default' keys -> int / None
-      tau_bounds[ft][param]: [lo, hi] list        -> (lo, hi) tuple
-      tau_mean_bounds[ft]:   [lo, hi] list        -> (lo, hi) tuple (or None)
-      taumean_cfg[ft]:       [[a, t], ...]        -> (('a', 'tau'), ...)
-      ratio_cfg[ft]:         [num, den]           -> ('num', 'den')
+      min_photons_by_ncomp: 'default' string key -> None; numeric string
+                             keys ('1', '2', '3') -> int
+      tau_bounds[ft][param]: [lo, hi] list -> (lo, hi) tuple
+      tau_mean_bounds[ft]:   [lo, hi] list -> (lo, hi) tuple (or None)
+      taumean_cfg[ft]:       [[a, t], ...] -> (('a', 'tau'), ...)
+      ratio_cfg[ft]:         [num, den]    -> ('num', 'den')
+
+    Parameters
+    ----------
+    path : Path or str, optional
+        Path to a YAML config file.  Defaults to config/default.yaml in
+        the project root (two directories above this file).
+
+    Returns
+    -------
+    dict
+        Normalized configuration dictionary.  Key entries:
+          'min_photons_by_ncomp' -- {int|None: int}, threshold per n_components
+          'chi2_lo', 'chi2_hi'   -- float, chi-squared acceptance window
+          'tau_bounds'           -- {fixation_type: {param: (lo, hi)}}
+          'tau_mean_bounds'      -- {fixation_type: (lo, hi) or None}
+          'taumean_cfg'          -- {fixation_type: (('a1','tau1'), ...)}
+          'ratio_cfg'            -- {fixation_type: ('numerator','denominator')}
+          'data_dirs'            -- {'win': [...], 'lin': [...]}
+
+    Side Effects
+    ------------
+    Reads the YAML file from disk.  Not cached; each call re-reads the file.
+
+    Assumptions
+    -----------
+    The YAML file must exist and be parseable by yaml.safe_load.  Unknown
+    top-level keys are passed through unmodified.
+
+    Examples
+    --------
+    >>> cfg = load_config()
+    >>> mask, brk = compute_fit_mask(
+    ...     fd, fixation_type='form', b_val=2,
+    ...     min_photons_by_ncomp=cfg['min_photons_by_ncomp'],
+    ...     chi2_lo=cfg['chi2_lo'], chi2_hi=cfg['chi2_hi'],
+    ...     tau_bounds=cfg['tau_bounds'],
+    ...     tau_mean_bounds=cfg['tau_mean_bounds'],
+    ... )
+
+    Dependencies
+    ------------
+    yaml, pathlib
     """
     p = Path(path) if path is not None else DEFAULT_CONFIG_PATH
     with open(p, encoding="utf-8") as fh:
@@ -88,16 +134,45 @@ def save_data_dirs(
 ) -> Path:
     """Write data_dirs to config/data_dirs.yaml (called by Phase A).
 
-    The file is overwritten in place each run.  Phase A is the single
-    authoritative source for which .sdt session directories belong to the
-    pipeline; downstream phases read this file via get_data_dirs().
+    Phase A is the single authoritative source for which .sdt session
+    directories belong to the pipeline.  Downstream phases read this file
+    via get_data_dirs().  The file is completely overwritten on each call
+    of this function.
 
-    Args:
-        win_dirs: list of Windows session-root paths (strings or Paths).
-        lin_dirs: list of Linux  session-root paths.
-        path:     defaults to config/data_dirs.yaml.
+    Parameters
+    ----------
+    win_dirs : list of str or Path
+        Windows session-root paths, e.g.
+        [r'E:\\18_RK_Circadian\\data\\raw\\20260429_KPC_fixed_dishes_on_SLIM'].
+    lin_dirs : list of str or Path
+        Linux session-root paths, e.g.
+        ['/media/mint/BRPresbkup/18_RK_Circadian/data/raw/20260429_...'].
+    path : Path or str, optional
+        Destination YAML file.  Defaults to config/data_dirs.yaml.
 
-    Returns the path written.
+    Returns
+    -------
+    Path
+        Path to the file that was written.
+
+    Side Effects
+    ------------
+    Creates or overwrites config/data_dirs.yaml.  Creates parent directories
+    if they do not exist.
+
+    Assumptions
+    -----------
+    Caller has write permission to the config/ directory.
+
+    Examples
+    --------
+    >>> from src.config import save_data_dirs
+    >>> win = [r'E:\\18_RK_Circadian\\data\\raw\\20260429_KPC_fixed_dishes_on_SLIM']
+    >>> p = save_data_dirs(win, [])
+
+    Dependencies
+    ------------
+    yaml, pathlib
     """
     out = Path(path) if path is not None else DATA_DIRS_PATH
     payload = {
@@ -126,18 +201,58 @@ def get_data_dirs(
 ) -> list[Path]:
     """Return raw .sdt session directories as Path objects.
 
+    Reads from config/data_dirs.yaml (written by Phase A) if it exists,
+    otherwise falls back to the data_dirs section of config/default.yaml.
+    The win: and lin: lists are unioned, deduplicated (order-preserving),
+    and optionally filtered to paths that exist on disk.
+
     Precedence:
       1. config/data_dirs.yaml  (written by Phase A; authoritative)
       2. config/default.yaml's data_dirs section (fallback for backwards
          compatibility before Phase A has been run on this checkout)
 
-    Returns the union of `win:` and `lin:` lists, filtered to paths that
-    exist on disk, deduplicated and order-preserving.
+    Parameters
+    ----------
+    config : dict, optional
+        Pre-loaded dict from load_config().  If None, both YAML files are
+        read from disk.
+    require_exist : bool, optional
+        If True (default), raise FileNotFoundError when none of the listed
+        paths exist on this machine.  Pass False to get the full list
+        even when the data drive is not mounted.
 
-    Args:
-        config:        pre-loaded default.yaml dict; if None, both files are
-                       loaded fresh.
-        require_exist: raise FileNotFoundError when nothing exists.
+    Returns
+    -------
+    list of Path
+        Deduplicated, order-preserving list of session root directories.
+        When require_exist=True, only paths that exist on disk are included.
+
+    Raises
+    ------
+    FileNotFoundError
+        When require_exist=True and no listed path exists on disk.
+
+    Side Effects
+    ------------
+    Reads YAML files from disk.
+
+    Assumptions
+    -----------
+    The win: and lin: lists may overlap (e.g. under WSL); duplicates are
+    silently removed.
+
+    Examples
+    --------
+    >>> data_dirs = get_data_dirs()
+    >>> # On Linux with the drive mounted:
+    >>> # [PosixPath('/media/mint/BRPresbkup/.../20260429_KPC_fixed_dishes_on_SLIM')]
+
+    >>> # Allow offline use (drive not mounted):
+    >>> all_dirs = get_data_dirs(require_exist=False)
+
+    Dependencies
+    ------------
+    yaml, pathlib
     """
     # 1. Prefer data_dirs.yaml when present
     raw: dict = {}

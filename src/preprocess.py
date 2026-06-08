@@ -21,7 +21,42 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 
 def label_of(stem: str) -> str:
-    """Filename stem -> 'CELLTYPE condition' string (e.g. 'BKO form 20min')."""
+    """Filename stem -> 'CELLTYPE condition' string (e.g. 'BKO form 20min').
+
+    Parses cell type (KPCWT or BKO) and fixation condition (live, form 20min,
+    form 10min, form, glu) from the filename stem by case-insensitive substring
+    matching.
+
+    Parameters
+    ----------
+    stem : str
+        Filename stem (with or without extension), e.g.
+        '3_KPCWT0430form20min_740nm_3024mW_u1_poc0p2_20x0p75NA_457s50_g70_z1_256pix_basicFLIM_120f_0000'.
+
+    Returns
+    -------
+    str
+        Label of the form 'CELLTYPE condition', e.g. 'KPCWT form 20min',
+        'BKO live', 'KPCWT glu'.  Returns 'KPCWT ?' or 'BKO ?' if the
+        condition cannot be determined.
+
+    Assumptions
+    -----------
+    'BKO' (case-insensitive) -> BKO; anything else -> KPCWT.
+    Condition tokens are searched in priority order: LIVE > FORM20MIN >
+    FORM10MIN > FORM > GLU.
+
+    Examples
+    --------
+    >>> label_of('3_KPCWT0430form20min_740nm...')
+    'KPCWT form 20min'
+    >>> label_of('5_BKO0501live_740nm...')
+    'BKO live'
+
+    Dependencies
+    ------------
+    None (stdlib only)
+    """
     s = str(stem).upper()
     cell = "BKO" if "BKO" in s else "KPCWT"
     if "LIVE" in s:
@@ -44,10 +79,41 @@ def label_of(stem: str) -> str:
 # ---------------------------------------------------------------------------
 
 def pockels_class(values, threshold: float = 0.3):
-    """Bin Pockels values into 'Low' (<= threshold) / 'High' (> threshold).
+    """Bin Pockels cell voltage into 'Low' (<= threshold) / 'High' (> threshold).
 
-    Accepts a scalar, list, pandas Series, or numpy array.  Returns the same
-    container type.  NaN inputs -> NaN.
+    Used to distinguish the two laser-power regimes in the dataset: low Pockels
+    (<=0.25, higher photon count) and high Pockels (>=0.45, lower photon count).
+    The 'PC' column in df_analysis is derived from this function via
+    build_analysis_df().
+
+    Parameters
+    ----------
+    values : scalar, list, np.ndarray, or pd.Series
+        Pockels cell voltage reading(s), typically in [0, 1].
+    threshold : float, optional
+        Boundary between 'Low' and 'High'.  Default 0.3 sits between the
+        two natural clusters (<=0.25 and >=0.45) in the KPC dataset.
+
+    Returns
+    -------
+    str, list, or pd.Series
+        Same container type as the input.  Each element is 'Low', 'High',
+        or float('nan') (for NaN inputs).
+
+    Assumptions
+    -----------
+    NaN inputs (pd.isna returns True) are passed through as float('nan').
+    numpy arrays and plain lists are returned as lists, not arrays.
+
+    Examples
+    --------
+    >>> pockels_class(0.25)           # -> 'Low'
+    >>> pockels_class(0.45)           # -> 'High'
+    >>> pockels_class(df['pockels'])  # -> pd.Series of 'Low'/'High'
+
+    Dependencies
+    ------------
+    numpy, pandas
     """
     if isinstance(values, pd.Series):
         return values.apply(lambda v: float("nan") if pd.isna(v)
@@ -83,23 +149,68 @@ def build_analysis_df(
          Phase E quality filtering).
       2. Merge any of `extra_sdt_cols` not already present from
          sdt_metadata_cal.csv.
-      3. Optionally merge position_annotation.csv on filename.
+      3. Optionally merge position_annotation.csv on filename (adds
+         'annotation' column; missing filenames get '(unannotated)').
       4. Optionally merge filepath_map.csv (raw .sdt filepath).
       5. Optionally derive `date` (from session_root, format YYYYMMDD) and
          `PC` ('Low'/'High' from pockels with `pockels_threshold`).
 
-    Args:
-        fit_analysis_csv:  path to fit_analysis_summary.csv (Phase E output).
-        sdt_metadata_csv:  path to sdt_metadata_cal.csv (Phase A/C output).
-        annotation_csv:    optional path to position_annotation.csv.
-        filepath_map_csv:  optional path to filepath_map.csv (for raw .sdt
-                           paths).
-        pockels_threshold: cutoff for 'Low'/'High' PC binning.
-        derive_date:       add a 'date' column (datetime).
-        derive_pc:         add a 'PC' column ('Low'/'High').
-        extra_sdt_cols:    columns to pull from sdt_metadata if not in fit_df.
+    Parameters
+    ----------
+    fit_analysis_csv : str or Path
+        Path to fit_analysis_summary.csv (Phase E output).  One row per
+        accepted .sdt image.  Must contain a 'filename' column.
+    sdt_metadata_csv : str or Path
+        Path to sdt_metadata_cal.csv (Phase A/C output).  Joined on
+        'filename'.
+    annotation_csv : str or Path, optional
+        Path to position_annotation.csv (adds 'annotation' column, e.g.
+        'colony_deep', 'colony_edge').
+    filepath_map_csv : str or Path, optional
+        Path to filepath_map.csv (adds 'filepath' with the absolute path to
+        the raw .sdt file; machine-specific).
+    pockels_threshold : float, optional
+        Cutoff for 'Low'/'High' PC binning.  Default 0.3.
+    derive_date : bool, optional
+        If True, parse 'date' (datetime) from the YYYYMMDD prefix of
+        session_root.
+    derive_pc : bool, optional
+        If True, add 'PC' column ('Low'/'High') from pockels column.
+    extra_sdt_cols : tuple of str, optional
+        Columns to pull from sdt_metadata if not already in fit_df.
+        Default: pockels, treatment_duration, frame_index,
+        phasor_cal_phase_rad, phasor_cal_mod, power_mW.
 
-    Returns the merged DataFrame.
+    Returns
+    -------
+    pd.DataFrame
+        Merged analysis DataFrame.  One row per accepted .sdt image.
+        Key columns: filename, session_root, fixation_type, cell_type,
+        em_filter_nm, n_components, tau_mean_median_ps, amp_ratio_median,
+        fit_set_key, fit_mask_path, n_px_final, pct_final, plus any
+        annotation/date/PC columns derived above.
+
+    Side Effects
+    ------------
+    Reads CSV files from disk.  annotation_csv and filepath_map_csv are
+    silently skipped if the file does not exist.
+
+    Assumptions
+    -----------
+    All CSVs use 'filename' as the join key.  session_root must start with
+    a YYYYMMDD date prefix for derive_date to succeed.
+
+    Examples
+    --------
+    >>> df_analysis = build_analysis_df(
+    ...     'results/fit_analysis_summary.csv',
+    ...     'results/sdt_metadata_cal.csv',
+    ...     annotation_csv='results/position_annotation.csv',
+    ... )
+
+    Dependencies
+    ------------
+    pandas, pathlib, pockels_class
     """
     sdt = pd.read_csv(sdt_metadata_csv)
     df  = pd.read_csv(fit_analysis_csv)
@@ -145,21 +256,48 @@ def build_analysis_df(
 def filter_subset(df: pd.DataFrame, **conditions) -> pd.DataFrame:
     """Filter a DataFrame to rows matching every condition in kwargs.
 
-    Each kwarg is one of:
-      - scalar value:           df[col] == value
+    All conditions are combined with logical AND.  NaN values in any
+    column never satisfy a condition (fillna(False) is applied internally).
+
+    Each kwarg value is interpreted as:
+      - scalar:                 df[col] == value
       - list/tuple/set/Series:  df[col].isin(value)
-      - callable(series)->bool: df[col].map(callable)
+      - callable:               df[col].map(callable)
 
-    Special handling:
-      - if a key isn't in df.columns, raises KeyError with a helpful message.
-      - to drop NaN rows in a column, pass `col=pd.notna` or use df.dropna().
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Source DataFrame (not modified; a copy is returned).
+    **conditions
+        Keyword arguments where each key is a column name and the value
+        is a scalar, collection, or callable as described above.
 
-    Examples:
-        filter_subset(df, fixation_type='form',
-                          em_filter_nm=[457, 475],
-                          PC='Low',
-                          annotation='colony_deep',
-                          treatment_duration='10min')
+    Returns
+    -------
+    pd.DataFrame
+        Filtered copy of df containing only matching rows.
+
+    Raises
+    ------
+    KeyError
+        If a condition key is not a column in df.
+
+    Assumptions
+    -----------
+    To explicitly drop NaN rows in a column, pass col=pd.notna (callable
+    form); otherwise NaN rows are simply excluded by fillna(False).
+
+    Examples
+    --------
+    >>> sub = filter_subset(df, fixation_type='form',
+    ...                         em_filter_nm=[457, 535],
+    ...                         PC='Low',
+    ...                         annotation='colony_edge')
+    >>> sub = filter_subset(df, pockels=pd.notna)  # drop rows where pockels is NaN
+
+    Dependencies
+    ------------
+    pandas, numpy
     """
     mask = pd.Series(True, index=df.index)
     for col, value in conditions.items():
